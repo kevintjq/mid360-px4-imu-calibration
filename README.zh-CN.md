@@ -1,6 +1,6 @@
 # Mid360/PX4 离线双 IMU 外参标定
 
-[English](README.en.md) | 中文
+[English](README.md) | 中文
 
 这是一个 ROS1 catkin 工程，只负责从 rosbag 读取 Mid360 IMU 和 PX4/MAVROS IMU 话题，离线计算外参参数，并把结果写成 `yaml` 和 `txt`。本工程不发布 MAVROS 话题。
 
