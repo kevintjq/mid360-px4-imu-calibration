@@ -1,0 +1,11 @@
+from distutils.core import setup
+
+from catkin_pkg.python_setup import generate_distutils_setup
+
+
+setup_args = generate_distutils_setup(
+    packages=["mid360_px4_calibration"],
+    package_dir={"": "."},
+)
+
+setup(**setup_args)

@@ -1,0 +1,28 @@
+# Offline input. Absolute paths are accepted.
+# Relative paths are resolved under this ROS package.
+bag_path: "/path/to/calibration.bag"
+mid_imu_topic: "/livox/imu"
+body_imu_topic: "/mavros/imu/data"
+stamp_source: "header"
+
+output_yaml: "config/calibration_result.yaml"
+output_txt: "config/calibration_result.txt"
+
+time_search_min_s: -0.5
+time_search_max_s: 0.5
+time_search_step_s:
+
+max_samples: 6000
+filter_window_s: 0.08
+filter_polyorder: 3
+trim_s: 0.5
+
+gyro_sigma_rad_s: 0.03
+accel_sigma_m_s2: 0.2
+robust_loss: "huber"
+
+accepted_gyro_rmse_rad_s: 0.12
+accepted_accel_rmse_m_s2: 0.8
+min_rotation_eigenvalue: 0.001
+min_translation_eigenvalue: 0.001
+max_translation_condition_number: 1000000.0
