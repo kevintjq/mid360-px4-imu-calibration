@@ -1,6 +1,6 @@
 # Mid360/PX4 Offline Dual-IMU Extrinsic Calibration
 
-English | [中文](README.zh-CN.md)
+English | [中文](README_CN.md)
 
 This is a ROS1 catkin package that only reads Mid360 IMU and PX4/MAVROS IMU topics from a rosbag, computes offline calibration parameters, and writes `yaml` and `txt` result files. It does not publish MAVROS topics.
 
