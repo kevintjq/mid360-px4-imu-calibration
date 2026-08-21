@@ -2,7 +2,7 @@
 
 English | [中文](README_CN.md)
 
-ROS1 / Ubuntu 20.04 C++ online extrinsic calibration for a Livox Mid360 and a PX4 body IMU. The node subscribes to two IMU topics and one LiDAR point-cloud topic, publishes nothing, and writes the Mid360 pose relative to the PX4 body frame in ENU convention.
+ROS1 / Ubuntu 20.04 C++ online extrinsic calibration for a Livox Mid360 and a PX4 body IMU. The node subscribes to two IMU topics and one LiDAR point-cloud topic, publishes nothing, and writes the Mid360 pose relative to the PX4 `base_link` body frame. MAVROS uses ROS ENU-side frame semantics; the body frame itself follows ROS FLU (forward-left-up) convention.
 
 The workflow follows the staged idea of [HKU-MaRS LiDAR_IMU_Init](https://github.com/hku-mars/LiDAR_IMU_Init):
 
@@ -62,7 +62,7 @@ mid360_relative_to_body_enu:
   rpy_B_M_deg: [roll, pitch, yaw]
 ```
 
-`T_B_M` maps a vector from the Mid360 frame `M` into the PX4 body frame `B`. The output uses ROS/MAVROS ENU-side semantics and does not apply an additional NED/FRD conversion.
+`T_B_M` maps a vector from the Mid360 sensor frame `M` into the PX4 `base_link` body frame `B`. The numerical axes are the message frame axes; the surrounding ROS world convention is ENU and the body convention is FLU. MAVROS already performs the FCU NED/FRD to ROS-side conversion, so this node does not apply another NED/FRD conversion.
 
 ## Data requirements and limitations
 

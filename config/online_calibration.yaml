@@ -3,6 +3,10 @@ mid_imu_topic: "/livox/imu"
 body_imu_topic: "/mavros/imu/data_raw"
 lidar_topic: "/livox/lidar"
 
+# ROS-side convention: MAVROS publishes the IMU in the ROS body frame
+# (normally base_link / FLU); ROS local/world coordinates are ENU. No extra
+# NED/FRD conversion is applied by this node.
+
 # Convert raw topic units to SI units before calibration.
 # Use 9.80665 if the corresponding accelerometer publishes in g.
 # Livox built-in IMU commonly reports acceleration in g. If `rostopic echo`

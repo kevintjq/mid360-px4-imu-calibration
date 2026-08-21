@@ -111,6 +111,14 @@ class Calibrator {
     if (!ros::ok()) return 2;
     if (!collectMotion()) return 2;
     collectStaticValidation();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ROS_INFO("Observed IMU frames: Mid360='%s', PX4='%s'", mid_frame_id_.c_str(), body_frame_id_.c_str());
+      if (body_frame_id_.find("_ned") != std::string::npos || body_frame_id_.find("_frd") != std::string::npos) {
+        ROS_ERROR("PX4 IMU frame '%s' is an explicit NED/FRD frame. Use MAVROS data_raw with frame_id base_link (ROS-side FLU) or configure the source frame before calibration.", body_frame_id_.c_str());
+        return 2;
+      }
+    }
     if (!checkData()) return 2;
     Result result;
     if (!solve(result)) return 3;
@@ -126,7 +134,7 @@ class Calibrator {
     ImuSample s{t, mid_gyro_scale_ * Vec3(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z),
                 mid_accel_scale_ * Vec3(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z)};
     if (!s.gyro.allFinite() || !s.accel.allFinite()) return;
-    std::lock_guard<std::mutex> lock(mutex_); mid_.push_back(s);
+    std::lock_guard<std::mutex> lock(mutex_); if (mid_frame_id_.empty()) mid_frame_id_ = msg->header.frame_id; mid_.push_back(s);
   }
 
   void bodyCallback(const sensor_msgs::ImuConstPtr &msg) {
@@ -135,7 +143,7 @@ class Calibrator {
     ImuSample s{t, body_gyro_scale_ * Vec3(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z),
                 body_accel_scale_ * Vec3(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z)};
     if (!s.gyro.allFinite() || !s.accel.allFinite()) return;
-    std::lock_guard<std::mutex> lock(mutex_); body_.push_back(s);
+    std::lock_guard<std::mutex> lock(mutex_); if (body_frame_id_.empty()) body_frame_id_ = msg->header.frame_id; body_.push_back(s);
   }
 
   static uint32_t u32(const uint8_t *p) { return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24); }
@@ -289,11 +297,11 @@ class Calibrator {
 
   std::string path(const std::string &p) const { if(!p.empty()&&p[0]=='/') return p; return ros::package::getPath("mid360_px4_calibration")+"/"+p; }
   static std::string list3(const Vec3 &v) { std::ostringstream s; s << std::fixed << std::setprecision(9) << "[" << v.x() << ", " << v.y() << ", " << v.z() << "]"; return s.str(); }
-  void writeResults(const Result&r){const std::string y=path(output_yaml_), t=path(output_txt_); Eigen::Vector3d e=r.R_B_M.transpose().eulerAngles(0,1,2)*180.0/M_PI; std::ofstream fy(y),ft(t); fy<<"mid360_relative_to_body_enu:\n  translation_B_M_m: "<<list3(r.t_B_M)<<"\n  rpy_B_M_deg: "<<list3(e)<<"\nquality:\n  dt_B_wrt_M_s: "<<r.dt<<"\n  gyro_rmse_rad_s: "<<r.gyro_rmse<<"\n  accel_rmse_m_s2: "<<r.accel_rmse<<"\n  pointcloud_mean_icp_error_m: "<<r.icp_rmse<<"\n  accepted: "<<(r.accepted?"true":"false")<<"\n  note: \""<<r.note<<"\"\n"; ft<<std::fixed<<std::setprecision(9)<<"Mid360 relative to PX4 body (ENU)\ntranslation_B_M_m: "<<r.t_B_M.transpose()<<"\nrpy_B_M_deg: "<<e.transpose()<<"\ndt_B_wrt_M_s: "<<r.dt<<"\ngyro_rmse_rad_s: "<<r.gyro_rmse<<"\naccel_rmse_m_s2: "<<r.accel_rmse<<"\npointcloud_mean_icp_error_m: "<<r.icp_rmse<<"\naccepted: "<<(r.accepted?"true":"false")<<"\nnote: "<<r.note<<"\n"; ROS_INFO("Result YAML: %s",y.c_str()); ROS_INFO("Result TXT: %s",t.c_str()); }
-  void printResult(const Result&r){const Eigen::Vector3d e=r.R_B_M.transpose().eulerAngles(0,1,2)*180.0/M_PI; std::cout<<"\n"<<CYAN<<"[Init Result] "<<RESET<<"Translation Mid360 to PX4 body = "<<r.t_B_M.transpose()<<" m\n"<<CYAN<<"[Init Result] "<<RESET<<"RPY (ENU) = "<<e.transpose()<<" deg\n"<<GREEN<<"[Init Result] "<<RESET<<"accepted="<<(r.accepted?"true":"false")<<", gyro RMSE="<<r.gyro_rmse<<", accel RMSE="<<r.accel_rmse<<"\n"; }
+  void writeResults(const Result&r){const std::string y=path(output_yaml_), t=path(output_txt_); const Eigen::Vector3d e=r.R_B_M.eulerAngles(0,1,2)*180.0/M_PI; std::ofstream fy(y),ft(t); fy<<"mid360_relative_to_body_enu:\n  convention: T_B_M maps Mid360 sensor frame M to ROS base_link body frame B (FLU); ROS world convention is ENU\n  translation_B_M_m: "<<list3(r.t_B_M)<<"\n  rpy_B_M_deg: "<<list3(e)<<"\nquality:\n  dt_B_wrt_M_s: "<<r.dt<<"\n  gyro_rmse_rad_s: "<<r.gyro_rmse<<"\n  accel_rmse_m_s2: "<<r.accel_rmse<<"\n  pointcloud_mean_icp_error_m: "<<r.icp_rmse<<"\n  accepted: "<<(r.accepted?"true":"false")<<"\n  note: \""<<r.note<<"\"\n"; ft<<std::fixed<<std::setprecision(9)<<"Mid360 relative to PX4 body\nconvention: T_B_M maps Mid360 sensor frame M to ROS base_link body frame B (FLU); ROS world convention is ENU\ntranslation_B_M_m: "<<r.t_B_M.transpose()<<"\nrpy_B_M_deg: "<<e.transpose()<<"\ndt_B_wrt_M_s: "<<r.dt<<"\ngyro_rmse_rad_s: "<<r.gyro_rmse<<"\naccel_rmse_m_s2: "<<r.accel_rmse<<"\npointcloud_mean_icp_error_m: "<<r.icp_rmse<<"\naccepted: "<<(r.accepted?"true":"false")<<"\nnote: "<<r.note<<"\n"; ROS_INFO("Result YAML: %s",y.c_str()); ROS_INFO("Result TXT: %s",t.c_str()); }
+  void printResult(const Result&r){const Eigen::Vector3d e=r.R_B_M.eulerAngles(0,1,2)*180.0/M_PI; std::cout<<"\n"<<CYAN<<"[Init Result] "<<RESET<<"Translation Mid360 to PX4 body (base_link/FLU) = "<<r.t_B_M.transpose()<<" m\n"<<CYAN<<"[Init Result] "<<RESET<<"RPY Mid360 to body (ROS ENU-side, XYZ) = "<<e.transpose()<<" deg\n"<<GREEN<<"[Init Result] "<<RESET<<"accepted="<<(r.accepted?"true":"false")<<", gyro RMSE="<<r.gyro_rmse<<", accel RMSE="<<r.accel_rmse<<"\n"; }
 
   ros::NodeHandle nh_,pnh_; ros::Subscriber mid_sub_,body_sub_,cloud_sub_; std::mutex mutex_; std::vector<ImuSample> mid_,body_; std::vector<Scan> scans_;
-  std::string mid_topic_,body_topic_,lidar_topic_,output_yaml_,output_txt_; double mid_accel_scale_,body_accel_scale_,mid_gyro_scale_,body_gyro_scale_,static_s_,motion_timeout_s_,update_s_,target_rad_,voxel_,max_corr_,max_icp_error_,time_min_,time_max_,time_step_; int min_samples_,min_scans_,max_points_,icp_iterations_; bool ansi_;
+  std::string mid_topic_,body_topic_,lidar_topic_,output_yaml_,output_txt_,mid_frame_id_,body_frame_id_; double mid_accel_scale_,body_accel_scale_,mid_gyro_scale_,body_gyro_scale_,static_s_,motion_timeout_s_,update_s_,target_rad_,voxel_,max_corr_,max_icp_error_,time_min_,time_max_,time_step_; int min_samples_,min_scans_,max_points_,icp_iterations_; bool ansi_;
 };
 }
 

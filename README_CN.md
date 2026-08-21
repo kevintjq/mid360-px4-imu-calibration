@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-这是一个面向 ROS1 / Ubuntu 20.04 的 C++ 在线外参标定工程，用于计算 Livox Mid360 与 PX4 飞控 body IMU 的相对位姿。节点只订阅两个 IMU 话题和一个点云话题，不发布任何话题，结果以 ENU 约定写入 YAML 和 TXT。
+这是一个面向 ROS1 / Ubuntu 20.04 的 C++ 在线外参标定工程，用于计算 Livox Mid360 与 PX4 `base_link` 机体 IMU 的相对位姿。节点只订阅两个 IMU 话题和一个点云话题，不发布任何话题。MAVROS 使用 ROS 侧 ENU 语义，但 `base_link` 本身是 ROS FLU（前-左-上）机体系。
 
 整体流程参考 [HKU-MaRS LiDAR_IMU_Init](https://github.com/hku-mars/LiDAR_IMU_Init)：
 
@@ -62,7 +62,7 @@ mid360_relative_to_body_enu:
   rpy_B_M_deg: [roll, pitch, yaw]
 ```
 
-`T_B_M` 表示把 Mid360 坐标系 `M` 中的向量变换到 PX4 body 坐标系 `B`。结果采用 ROS/MAVROS 的 ENU 侧语义，不再额外做 NED/FRD 转换。
+`T_B_M` 表示把 Mid360 传感器坐标系 `M` 中的向量变换到 PX4 `base_link` 机体坐标系 `B`。数值轴使用消息自身的坐标轴；周围 ROS 世界坐标约定为 ENU，机体系约定为 FLU。MAVROS 已经完成 FCU NED/FRD 到 ROS 侧的转换，本节点不再重复做 NED/FRD 转换。
 
 ## 数据要求与限制
 
