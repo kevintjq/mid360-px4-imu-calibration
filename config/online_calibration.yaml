@@ -1,7 +1,19 @@
 # Online calibration reads these two sensor_msgs/Imu topics directly.
 mid_imu_topic: "/livox/imu"
-body_imu_topic: "/mavros/imu/data"
+body_imu_topic: "/mavros/imu/data_raw"
+lidar_topic: "/livox/lidar"
+use_pointcloud: true
+lidar_required: true
 stamp_source: "header"
+
+# Convert raw topic units to SI units before calibration.
+# Use 9.80665 if the corresponding accelerometer publishes in g.
+# Livox built-in IMU commonly reports acceleration in g. If `rostopic echo`
+# shows approximately 9.8 while stationary, change this back to 1.0.
+mid_accel_scale: 9.80665
+body_accel_scale: 1.0
+mid_gyro_scale: 1.0
+body_gyro_scale: 1.0
 
 # Output paths are relative to this package unless absolute paths are used.
 output_yaml: "config/online_calibration_result.yaml"
@@ -9,10 +21,18 @@ output_txt: "config/online_calibration_result.txt"
 
 # The operator is guided through these phases in the terminal.
 interactive_prompts: true
-phase_duration_s: 15.0
-static_duration_s: 5.0
+phase_duration_s: 4.0
+static_duration_s: 2.5
 min_samples: 500
 validate_split: true
+max_lidar_scans: 300
+min_lidar_scans: 15
+lidar_voxel_size_m: 0.20
+lidar_max_correspondence_m: 2.0
+lidar_icp_iterations: 8
+lidar_min_correspondences: 40
+lidar_max_points_per_scan: 1200
+max_lidar_icp_error_m: 0.25
 
 time_search_min_s: -0.5
 time_search_max_s: 0.5

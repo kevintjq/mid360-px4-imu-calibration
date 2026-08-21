@@ -59,6 +59,10 @@ def _correlation_at_lag(
     if end <= start + 10.0 * step_s:
         return float("nan")
     t_mid = np.arange(start, end, step_s)
+    # arange can include an endpoint a few ulps beyond the overlap interval.
+    # Clamp explicitly because ImuInterpolator intentionally rejects extrapolation.
+    t_mid = t_mid[(t_mid >= mid.start) & (t_mid <= mid.end)]
+    t_mid = t_mid[(t_mid + dt >= body.start) & (t_mid + dt <= body.end)]
     if len(t_mid) < 10:
         return float("nan")
     s_mid = np.linalg.norm(mid_interp.gyro(t_mid), axis=1)

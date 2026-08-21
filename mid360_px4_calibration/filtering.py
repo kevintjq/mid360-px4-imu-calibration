@@ -6,6 +6,22 @@ from scipy.signal import savgol_filter
 from .types import ImuSamples
 
 
+def resample_uniform(samples: ImuSamples) -> ImuSamples:
+    """Interpolate an IMU stream onto its median-period uniform time grid."""
+    dt = samples.median_dt
+    if not np.isfinite(dt) or dt <= 0.0:
+        return samples
+    count = int(np.floor((samples.end - samples.start) / dt)) + 1
+    if count < 3:
+        return samples
+    timestamps = samples.start + np.arange(count, dtype=float) * dt
+    if timestamps[-1] < samples.end - 0.25 * dt:
+        timestamps = np.r_[timestamps, samples.end]
+    gyro = np.column_stack([np.interp(timestamps, samples.timestamps, samples.gyro[:, i]) for i in range(3)])
+    accel = np.column_stack([np.interp(timestamps, samples.timestamps, samples.accel[:, i]) for i in range(3)])
+    return ImuSamples(timestamps, gyro, accel, frame_id=samples.frame_id)
+
+
 def savgol_filter_samples(samples: ImuSamples, window_s: float, polyorder: int) -> ImuSamples:
     window = _window_length(samples.median_dt, window_s, len(samples.timestamps), polyorder)
     if window <= polyorder + 1:

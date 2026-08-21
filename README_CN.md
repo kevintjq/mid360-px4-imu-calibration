@@ -1,54 +1,43 @@
-# Mid360/PX4 在线双 IMU 外参标定
+# Mid360/PX4 点云辅助在线标定
 
 [English](README.md) | 中文
 
-这是一个 ROS1 catkin 工程，用于计算 Livox Mid360 IMU 与 PX4/MAVROS 飞控 body IMU 之间的刚性外参。推荐使用**在线标定**：节点直接订阅两个 `sensor_msgs/Imu` 话题，在终端提示操作者按阶段运动，计算完成后写出 YAML/TXT 结果。节点不会发布任何 ROS 话题。
+这是一个 ROS1 catkin 工程，用于在线标定 Mid360 坐标系与 PX4 飞控 body IMU 的外参。推荐流程同时读取两个 IMU 话题和一个点云话题：先用稳健 ICP 估计点云运动，再让两个 IMU 分别相对于同一个 LiDAR 运动参考进行标定，最后链式计算 Mid360 到 body 的外参。节点只订阅，不发布任何话题。
 
-原有 rosbag 离线流程仍然保留，方便重复实验和复现。
+流程参考 LI-Init 的分阶段思想：静止阶段检查重力和单位，运动阶段检查可观测性，再进行时间对齐、旋转/偏置初始化以及平移/加速度优化。LI-Init 本身使用 LIO 产生的 LiDAR 运动状态；本工程提供轻量的 PointCloud2/Livox 点云 ICP 前端。
 
-## 标定内容
+## 输入
 
-- 时间偏移 `dt_B_wrt_M`；
-- 两个 IMU 坐标系之间的旋转和平移；
-- 合并后的陀螺仪和加速度计偏置；
-- 残差、可观测性特征值、条件数和是否通过质量检查。
-
-结果包含你要求的 ENU 侧表示：
+`config/online_calibration.yaml` 的默认配置为：
 
 ```yaml
-mid360_relative_to_body_enu:
-  translation_B_M_m: [x, y, z]
-  rpy_B_M_deg: [roll, pitch, yaw]
+mid_imu_topic: "/livox/imu"
+body_imu_topic: "/mavros/imu/data_raw"
+lidar_topic: "/livox/lidar"
 ```
 
-这里的 `T_B_M` 表示把 Mid360 坐标系 `M` 映射到 PX4 body 坐标系 `B`。输出采用 ROS/MAVROS 侧 ENU 语义，不会偷偷再做一次 NED/FRD 转换。
+两个 IMU 话题必须是 `sensor_msgs/Imu`。点云订阅器支持 `sensor_msgs/PointCloud2`，也支持包含 `points[].x/y/z` 的 Livox 风格消息。角速度必须是 `rad/s`。加速度会按 YAML 中的比例换算；Livox 内置 IMU 常见情况需要设置 `mid_accel_scale: 9.80665`，PX4 raw IMU 通常已经是 `m/s^2`。运行前请用 `rostopic echo` 检查静止时的加速度模长。
 
-## 为什么在线流程能改善误差
+## 运动流程
 
-XYZ 杆臂通常比旋转更难标定。杆臂只通过角加速度和向心加速度产生的差异可观测；静止数据或单轴匀速转动不能可靠确定 XYZ。因此在线流程固定包含：
+终端会依次提示：
 
-1. 静止阶段，用于观察偏置和噪声；
-2. 分别绕 X、Y、Z 轴正反转；
-3. 三轴组合运动，并改变转动速度；
-4. 最后静止；
-5. 可选的前后半段一致性检查。
+1. 静止；
+2. roll：绕 X 轴缓慢正反转；
+3. pitch：绕 Y 轴缓慢正反转；
+4. yaw：绕 Z 轴缓慢正反转；
+5. roll/pitch/yaw 组合运动，并改变角速度；
+6. 最后静止验证。
 
-不要因为程序运行结束就直接接受 XYZ。必须查看 `accepted`、加速度 RMSE、translation condition number 以及前后半段差异。如果结果不稳定，请用更慢、更大幅度的三轴运动重复采集，并确保两个 IMU 刚性固定。
+默认采集时间约 25 秒，不包括操作者在提示之间按回车的时间。
 
-## 读取的话题和单位
-
-节点只读取以下两个话题：
-
-- Mid360 IMU：默认 `/livox/imu`；
-- PX4/MAVROS IMU：默认 `/mavros/imu/data`。
-
-两个话题都必须是 `sensor_msgs/Imu`。角速度单位必须是 `rad/s`，线加速度单位必须是 `m/s^2`。节点使用 `header.stamp`，并自动读取非空的 `header.frame_id` 写入结果。
+Mid360、两个 IMU 和安装结构必须刚性固定。点云环境应静止且有足够几何结构；空白墙面、移动物体或严重扫描畸变都会导致 ICP 失效。节点会输出点云数量、平均 ICP 误差、残差、可观测性和前后半段一致性。优化收敛不代表结果一定可靠。
 
 ## Ubuntu 20.04 / ROS Noetic 编译
 
 ```bash
 sudo apt update
-sudo apt install python3-numpy python3-scipy python3-yaml python3-rospkg ros-noetic-rosbag ros-noetic-sensor-msgs
+sudo apt install python3-numpy python3-scipy python3-yaml python3-rospkg ros-noetic-roslib ros-noetic-sensor-msgs
 mkdir -p ~/catkin_ws/src
 cd ~/catkin_ws/src
 git clone https://github.com/kevintjq/mid360-px4-imu-calibration.git
@@ -57,55 +46,38 @@ catkin_make
 source devel/setup.bash
 ```
 
-## 推荐：在线标定
+## 启动
 
-编辑 [config/online_calibration.yaml](config/online_calibration.yaml)：
-
-```yaml
-mid_imu_topic: "/livox/imu"
-body_imu_topic: "/mavros/imu/data"
-output_yaml: "config/online_calibration_result.yaml"
-output_txt: "config/online_calibration_result.txt"
-interactive_prompts: true
-phase_duration_s: 15.0
-static_duration_s: 5.0
-validate_split: true
-```
-
-在两个 IMU 话题都已经发布时启动：
+编辑 [config/online_calibration.yaml](config/online_calibration.yaml)，然后运行：
 
 ```bash
 roslaunch mid360_px4_calibration online_calibration.launch
 ```
 
-按照终端提示操作。整个 Mid360、飞控和安装结构必须保持刚性，不要单独平移某个传感器。X/Y/Z 阶段都要正反转；组合阶段要改变角速度并尽量激励三轴。
-
-节点默认写出：
+结果写入：
 
 - `config/online_calibration_result.yaml`；
 - `config/online_calibration_result.txt`。
 
-如果工程目录不可写，请把输出改成绝对路径。
+最终 YAML 包含：
 
-## rosbag 离线模式
-
-编辑 [config/offline_calibration.yaml](config/offline_calibration.yaml)，填写 bag 路径和同样的两个 IMU 话题，然后运行：
-
-```bash
-roslaunch mid360_px4_calibration offline_calibration.launch
+```yaml
+mid360_relative_to_body_enu:
+  translation_B_M_m: [x, y, z]
+  rpy_B_M_deg: [roll, pitch, yaw]
 ```
 
-bag 必须包含两个带有效时间戳且时间范围有重叠的 `sensor_msgs/Imu` 话题。不需要 odom，程序也不会发布输出话题。
+`T_B_M` 表示 Mid360 坐标系 `M` 到 PX4 body 坐标系 `B` 的变换，采用 ROS/MAVROS 侧 ENU 语义，不额外执行 NED/FRD 转换。
+
+## 质量检查
+
+重点查看 `accepted`、加速度 RMSE、translation 特征值/条件数、平均 ICP 误差以及前后半段差异。如果有效点云扫描少于 `min_lidar_scans`，或 ICP 无法保持足够匹配点，程序会直接停止，不返回一个容易误用的 XYZ。
 
 ## 测试
-
-数值测试不依赖 ROS：
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
-
-ROS 级别必须在 Ubuntu 20.04/ROS Noetic 上用 `catkin_make` 和 `roslaunch` 验证；Windows 开发环境不能替代这一步。
 
 ## 许可证
 

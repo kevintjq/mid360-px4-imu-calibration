@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
-from .filtering import angular_acceleration, savgol_filter_samples, trim_samples
+from .filtering import angular_acceleration, resample_uniform, savgol_filter_samples, trim_samples
 from .interpolation import ImuInterpolator, paired_times
 from .math_utils import ensure_rotation_matrix, validation_stats
 from .observability import acceptance_notes, rotation_observability_eigenvalues
@@ -17,8 +17,21 @@ from .types import CalibrationConfig, CalibrationResult, ImuSamples
 
 def calibrate(mid_raw: ImuSamples, body_raw: ImuSamples, config: Optional[CalibrationConfig] = None) -> CalibrationResult:
     config = config or CalibrationConfig()
-    mid = trim_samples(savgol_filter_samples(mid_raw, config.filter_window_s, config.filter_polyorder), config.trim_s)
-    body = trim_samples(savgol_filter_samples(body_raw, config.filter_window_s, config.filter_polyorder), config.trim_s)
+    mid_scaled = mid_raw.with_values(
+        gyro=mid_raw.gyro * float(config.mid_gyro_scale),
+        accel=mid_raw.accel * float(config.mid_accel_scale),
+    )
+    body_scaled = body_raw.with_values(
+        gyro=body_raw.gyro * float(config.body_gyro_scale),
+        accel=body_raw.accel * float(config.body_accel_scale),
+    )
+    # ROS delivery intervals are not perfectly uniform. Resampling before
+    # Savitzky-Golay differentiation avoids using one median dt for a bursty
+    # stream, which otherwise corrupts angular acceleration and the lever arm.
+    mid_uniform = resample_uniform(mid_scaled)
+    body_uniform = resample_uniform(body_scaled)
+    mid = trim_samples(savgol_filter_samples(mid_uniform, config.filter_window_s, config.filter_polyorder), config.trim_s)
+    body = trim_samples(savgol_filter_samples(body_uniform, config.filter_window_s, config.filter_polyorder), config.trim_s)
     time = estimate_time_offset(
         mid,
         body,

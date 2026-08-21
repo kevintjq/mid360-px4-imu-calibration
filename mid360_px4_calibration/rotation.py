@@ -19,6 +19,7 @@ def solve_rotation_and_time(
     gyro_sigma: float,
     robust_loss: str,
 ) -> Tuple[RotationResult, float]:
+    initial_dt = float(np.clip(initial_dt, time_bounds[0], time_bounds[1]))
     times = paired_times(mid, body, initial_dt, max_samples)
     body_interp = ImuInterpolator(body)
     omega_m = mid.gyro[np.searchsorted(mid.timestamps, times)]

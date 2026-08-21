@@ -110,6 +110,8 @@ def write_result_txt(path: Union[str, Path], result: Any, config: CalibrationCon
             "  translation_condition_number: {:.9f}".format(quality["translation_condition_number"]),
             "  split_half_rotation_deg: {}".format(_fmt_optional(quality["split_half_rotation_deg"], 6)),
             "  split_half_translation_cm: {}".format(_fmt_optional(quality["split_half_translation_cm"], 6)),
+            "  pointcloud_motion_samples: {}".format(quality["pointcloud_motion_samples"]),
+            "  pointcloud_mean_icp_error_m: {}".format(_fmt_optional(quality["pointcloud_mean_icp_error_m"], 6)),
             "  accepted: {}".format(quality["accepted"]),
         ]
     )

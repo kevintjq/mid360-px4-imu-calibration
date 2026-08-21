@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <package format="2">
   <name>mid360_px4_calibration</name>
-  <version>0.2.0</version>
-  <description>Online and offline Mid360/PX4 dual-IMU extrinsic calibration from sensor_msgs/Imu topics.</description>
+  <version>0.3.0</version>
+  <description>Point-cloud-aided online Mid360/PX4 IMU extrinsic calibration.</description>
 
   <maintainer email="kevintjq@users.noreply.github.com">kevintjq</maintainer>
   <license>MIT</license>
@@ -10,7 +10,7 @@
   <buildtool_depend>catkin</buildtool_depend>
 
   <exec_depend>rospy</exec_depend>
-  <exec_depend>rosbag</exec_depend>
+  <exec_depend>roslib</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-rospkg</exec_depend>

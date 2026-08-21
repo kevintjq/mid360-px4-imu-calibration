@@ -55,6 +55,12 @@ class ImuSamples:
 class CalibrationConfig:
     mid_frame: str = "mid360_imu"
     body_frame: str = "base_link"
+    # Convert raw topic units to SI units before calibration. For example,
+    # set mid_accel_scale=9.80665 when a Livox IMU publishes acceleration in g.
+    mid_accel_scale: float = 1.0
+    body_accel_scale: float = 1.0
+    mid_gyro_scale: float = 1.0
+    body_gyro_scale: float = 1.0
     time_search_min_s: float = -0.5
     time_search_max_s: float = 0.5
     time_search_step_s: Optional[float] = None
@@ -127,6 +133,8 @@ class CalibrationResult:
     notes: List[str] = field(default_factory=list)
     split_half_rotation_deg: Optional[float] = None
     split_half_translation_cm: Optional[float] = None
+    pointcloud_motion_samples: Optional[int] = None
+    pointcloud_mean_icp_error_m: Optional[float] = None
 
     def as_yaml_dict(self, config: CalibrationConfig) -> Dict[str, Any]:
         from scipy.spatial.transform import Rotation
@@ -190,6 +198,12 @@ class CalibrationResult:
                 "split_half_translation_cm": None
                 if self.split_half_translation_cm is None
                 else float(self.split_half_translation_cm),
+                "pointcloud_motion_samples": None
+                if self.pointcloud_motion_samples is None
+                else int(self.pointcloud_motion_samples),
+                "pointcloud_mean_icp_error_m": None
+                if self.pointcloud_mean_icp_error_m is None
+                else float(self.pointcloud_mean_icp_error_m),
                 "accepted": bool(self.accepted),
                 "notes": list(self.notes),
             },

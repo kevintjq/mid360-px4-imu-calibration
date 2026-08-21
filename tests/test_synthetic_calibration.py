@@ -6,6 +6,7 @@ from scipy.spatial.transform import Rotation
 from mid360_px4_calibration import CalibrationConfig, ImuSamples, calibrate
 from mid360_px4_calibration.filtering import angular_acceleration
 from mid360_px4_calibration.math_utils import hat
+from mid360_px4_calibration.interpolation import paired_times
 from mid360_px4_calibration.rotation import wahba_rotation
 
 
@@ -62,6 +63,11 @@ def synthetic_pair(dt=0.037, noise=0.0):
 
 
 class CalibrationTests(unittest.TestCase):
+    def test_paired_times_length_is_stable_across_time_offset(self):
+        mid, body, _, _, _ = synthetic_pair()
+        lengths = [len(paired_times(mid, body, dt, 1000)) for dt in (-0.09, -0.01, 0.0, 0.07, 0.09)]
+        self.assertEqual(lengths, [1000] * 5)
+
     def test_wahba_rotation_direction(self):
         mid, body, R_M_B, _, dt = synthetic_pair()
         body_at_mid = np.column_stack([np.interp(mid.timestamps + dt, body.timestamps, body.gyro[:, i]) for i in range(3)])

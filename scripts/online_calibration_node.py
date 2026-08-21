@@ -10,14 +10,19 @@ from __future__ import annotations
 import sys
 import threading
 import time
+from dataclasses import replace
 from typing import List, Tuple
 
 import numpy as np
 import rospy
+import roslib.message
 import rospkg
+from sensor_msgs import point_cloud2
 from sensor_msgs.msg import Imu
 
 from mid360_px4_calibration.io import sanitize_samples, write_result_txt, write_result_yaml
+from mid360_px4_calibration.lidar_motion import PointCloudScan, estimate_lidar_motion
+from mid360_px4_calibration.lidar_solver import calibrate_lidar_body, combine_lidar_sensor_results
 from mid360_px4_calibration.solver import calibrate
 from mid360_px4_calibration.types import CalibrationConfig, ImuSamples
 
@@ -61,6 +66,68 @@ class ImuBuffer:
             return len(self._mid), len(self._body)
 
 
+class PointCloudBuffer:
+    def __init__(self, max_scans: int = 600) -> None:
+        self._lock = threading.Lock()
+        self._scans: List[PointCloudScan] = []
+        self._max_scans = max_scans
+
+    def add_anymsg(self, msg) -> None:
+        try:
+            scan = _decode_point_cloud(msg)
+        except Exception as exc:
+            rospy.logwarn_throttle(10.0, "point-cloud decode failed: %s", exc)
+            return
+        if scan is None or len(scan.points) < 80:
+            return
+        with self._lock:
+            self._scans.append(scan)
+            if len(self._scans) > self._max_scans:
+                self._scans = self._scans[-self._max_scans :]
+
+    def snapshot(self) -> List[PointCloudScan]:
+        with self._lock:
+            return list(self._scans)
+
+
+def _decode_point_cloud(msg) -> PointCloudScan:
+    connection_header = getattr(msg, "_connection_header", {}) or {}
+    type_name = connection_header.get("type", "")
+    msg_class = roslib.message.get_message_class(type_name)
+    if msg_class is None:
+        raise ValueError("unsupported point-cloud message type: {}".format(type_name))
+    decoded = msg_class()
+    decoded.deserialize(msg._buff)
+    header = getattr(decoded, "header", None)
+    timestamp = None
+    frame_id = ""
+    if header is not None:
+        timestamp = header.stamp.to_sec()
+        frame_id = header.frame_id or ""
+    if timestamp is None or timestamp <= 0.0:
+        timebase = getattr(decoded, "timebase", None)
+        if timebase is not None:
+            timestamp = float(timebase) * 1.0e-9
+    if timestamp is None or not np.isfinite(timestamp):
+        raise ValueError("point cloud has no valid timestamp")
+    if type_name == "sensor_msgs/PointCloud2":
+        points = np.asarray(
+            list(point_cloud2.read_points(decoded, field_names=("x", "y", "z"), skip_nans=True)),
+            dtype=float,
+        )
+    elif hasattr(decoded, "points"):
+        points = np.asarray(
+            [[float(point.x), float(point.y), float(point.z)] for point in decoded.points],
+            dtype=float,
+        )
+    else:
+        raise ValueError("point cloud message has no x/y/z fields")
+    points = points[np.all(np.isfinite(points), axis=1)]
+    if len(points) > 4000:
+        points = points[:: max(1, len(points) // 4000)]
+    return PointCloudScan(float(timestamp), points, frame_id)
+
+
 def _to_samples(items: List[Tuple[float, np.ndarray, np.ndarray, str]]) -> ImuSamples:
     if len(items) < 3:
         raise ValueError("not enough IMU samples")
@@ -73,6 +140,10 @@ def _to_samples(items: List[Tuple[float, np.ndarray, np.ndarray, str]]) -> ImuSa
 
 def config_from_ros_params() -> CalibrationConfig:
     return CalibrationConfig(
+        mid_accel_scale=float(param("mid_accel_scale", 1.0)),
+        body_accel_scale=float(param("body_accel_scale", 1.0)),
+        mid_gyro_scale=float(param("mid_gyro_scale", 1.0)),
+        body_gyro_scale=float(param("body_gyro_scale", 1.0)),
         time_search_min_s=float(param("time_search_min_s", -0.5)),
         time_search_max_s=float(param("time_search_max_s", 0.5)),
         time_search_step_s=param("time_search_step_s", None),
@@ -98,14 +169,14 @@ def _wait_for_enter(prompt: str, interactive: bool) -> bool:
         rospy.loginfo(prompt)
         return True
     try:
-        input(prompt + " 按回车开始 / press Enter to start... ")
+        input(prompt + " | press Enter to start... ")
         return not rospy.is_shutdown()
     except (EOFError, KeyboardInterrupt):
         return False
 
 
 def _collect_phase(buffer: ImuBuffer, duration: float, label: str) -> None:
-    rospy.loginfo("开始阶段: %s (%.1f s)", label, duration)
+    rospy.loginfo("Starting phase: %s (%.1f s)", label, duration)
     # Use wall time for the operator countdown.  This keeps the workflow
     # usable even if /use_sim_time is enabled but no /clock is available.
     end = time.monotonic() + duration
@@ -116,19 +187,41 @@ def _collect_phase(buffer: ImuBuffer, duration: float, label: str) -> None:
         if now - last_report >= 5.0:
             n_mid, n_body = buffer.counts()
             remaining = max(0.0, end - now)
-            rospy.loginfo("  剩余 %.1f s, samples: Mid360=%d PX4=%d", remaining, n_mid, n_body)
+            rospy.loginfo("  remaining %.1f s, samples: Mid360=%d PX4=%d", remaining, n_mid, n_body)
             last_report = now
 
 
 def _motion_report(mid: ImuSamples, body: ImuSamples) -> None:
-    gyro_mid = np.linalg.norm(mid.gyro - np.mean(mid.gyro, axis=0), axis=1)
-    gyro_body = np.linalg.norm(body.gyro - np.mean(body.gyro, axis=0), axis=1)
+    gyro_mid = np.std(mid.gyro, axis=0)
+    gyro_body = np.std(body.gyro, axis=0)
     rospy.loginfo(
-        "运动激励: Mid360 gyro std=%.3f rad/s, PX4 gyro std=%.3f rad/s; "
-        "请确保三轴都有明显转动。",
-        float(np.std(gyro_mid)),
-        float(np.std(gyro_body)),
+        "Motion excitation, gyro std [x y z]: Mid360=[%.3f %.3f %.3f], PX4=[%.3f %.3f %.3f] rad/s",
+        *[float(v) for v in gyro_mid],
+        *[float(v) for v in gyro_body],
     )
+
+
+def _accel_norm_report(mid: ImuSamples, body: ImuSamples, config: CalibrationConfig) -> None:
+    """Warn about the common Livox-g versus Pixhawk-m/s^2 unit mismatch."""
+    def static_norm(samples: ImuSamples) -> float:
+        count = max(10, int(round(5.0 * samples.frequency_hz)))
+        count = min(count, len(samples.timestamps) // 2)
+        values = np.r_[samples.accel[:count], samples.accel[-count:]]
+        return float(np.median(np.linalg.norm(values, axis=1)))
+
+    mid_norm = static_norm(mid)
+    body_norm = static_norm(body)
+    rospy.loginfo(
+        "Raw static acceleration norms: Mid360=%.4f, PX4=%.4f (scales %.6g, %.6g)",
+        mid_norm,
+        body_norm,
+        config.mid_accel_scale,
+        config.body_accel_scale,
+    )
+    if abs(mid_norm - 1.0) < 0.25 and mid_norm < 2.0 and config.mid_accel_scale == 1.0:
+        rospy.logwarn("Mid360 acceleration looks like g, not m/s^2. Set mid_accel_scale: 9.80665.")
+    if abs(body_norm - 1.0) < 0.25 and body_norm < 2.0 and config.body_accel_scale == 1.0:
+        rospy.logwarn("PX4 acceleration looks like g, not m/s^2. Set body_accel_scale: 9.80665.")
 
 
 def _split_consistency(mid: ImuSamples, body: ImuSamples, config: CalibrationConfig):
@@ -151,62 +244,109 @@ def _split_consistency(mid: ImuSamples, body: ImuSamples, config: CalibrationCon
 def main() -> int:
     rospy.init_node("mid360_px4_online_calibration")
     mid_topic = param("mid_imu_topic", "/livox/imu")
-    body_topic = param("body_imu_topic", "/mavros/imu/data")
+    body_topic = param("body_imu_topic", "/mavros/imu/data_raw")
+    lidar_topic = param("lidar_topic", "/livox/lidar")
+    use_pointcloud = bool(param("use_pointcloud", True))
+    lidar_required = bool(param("lidar_required", True))
     interactive = bool(param("interactive_prompts", True))
-    phase_duration = float(param("phase_duration_s", 15.0))
-    static_duration = float(param("static_duration_s", 5.0))
+    phase_duration = float(param("phase_duration_s", 4.0))
+    static_duration = float(param("static_duration_s", 2.5))
     min_samples = int(param("min_samples", 500))
     output_yaml = resolve_package_path(param("output_yaml", "config/online_calibration_result.yaml"))
     output_txt = resolve_package_path(param("output_txt", "config/online_calibration_result.txt"))
     config = config_from_ros_params()
     buffer = ImuBuffer()
+    cloud_buffer = PointCloudBuffer(max_scans=int(param("max_lidar_scans", 300)))
     rospy.Subscriber(mid_topic, Imu, lambda msg: buffer.add("mid", msg), queue_size=10000)
     rospy.Subscriber(body_topic, Imu, lambda msg: buffer.add("body", msg), queue_size=10000)
-    rospy.loginfo("在线标定已启动，只读取两个 IMU 话题，不发布任何话题。")
-    rospy.loginfo("Mid360: %s | PX4/MAVROS: %s", mid_topic, body_topic)
+    if use_pointcloud:
+        rospy.Subscriber(lidar_topic, rospy.AnyMsg, cloud_buffer.add_anymsg, queue_size=20)
+    rospy.loginfo("Online calibration started. Subscribes only; publishes no topic.")
+    rospy.loginfo("Mid360 IMU: %s | PX4/MAVROS IMU: %s", mid_topic, body_topic)
+    if use_pointcloud:
+        rospy.loginfo("Point cloud: %s", lidar_topic)
 
     phases = [
-        ("静止，保持设备不动", static_duration),
-        ("只绕 X 轴缓慢正反转，幅度约 ±30 度", phase_duration),
-        ("只绕 Y 轴缓慢正反转，幅度约 ±30 度", phase_duration),
-        ("只绕 Z 轴缓慢正反转，幅度约 ±30 度", phase_duration),
-        ("组合绕 X/Y/Z 三轴转动，速度要有变化，不要只做单轴", phase_duration * 2.0),
-        ("停止转动，保持静止用于检查", static_duration),
+        ("static: keep the rigid assembly still", static_duration),
+        ("roll: rotate slowly forward/back around X, about +/-30 deg", phase_duration),
+        ("pitch: rotate slowly forward/back around Y, about +/-30 deg", phase_duration),
+        ("yaw: rotate slowly forward/back around Z, about +/-30 deg", phase_duration),
+        ("combined roll/pitch/yaw: change angular speed and excite all axes", phase_duration * 2.0),
+        ("static: stop and keep still for validation", static_duration),
     ]
     for label, duration in phases:
         if not _wait_for_enter(label, interactive):
-            rospy.logwarn("在线标定被中止")
+            rospy.logwarn("Online calibration aborted")
             return 2
         _collect_phase(buffer, duration, label)
 
     try:
         mid, body = buffer.snapshot()
     except ValueError as exc:
-        rospy.logerr("读取 IMU 数据失败: %s", exc)
+        rospy.logerr("Failed to read IMU data: %s", exc)
         return 2
     n_mid, n_body = len(mid.timestamps), len(body.timestamps)
-    rospy.loginfo("采集完成: Mid360=%d, PX4=%d", n_mid, n_body)
+    rospy.loginfo("Collection complete: Mid360=%d, PX4=%d", n_mid, n_body)
     if n_mid < min_samples or n_body < min_samples:
-        rospy.logerr("样本太少（需要至少 %d 个/话题）", min_samples)
+        rospy.logerr("Too few samples (need at least %d per topic)", min_samples)
         return 2
     if mid.frame_id:
         config.mid_frame = mid.frame_id
     if body.frame_id:
         config.body_frame = body.frame_id
     _motion_report(mid, body)
+    _accel_norm_report(mid, body, config)
 
-    rospy.loginfo("开始计算，数据越长、三轴运动越充分，杆臂 XYZ 越稳定。")
+    rospy.loginfo("Starting calibration. Longer data and full 3-axis excitation improve XYZ stability.")
     try:
-        result = calibrate(mid, body, config)
+        if use_pointcloud:
+            scans = cloud_buffer.snapshot()
+            rospy.loginfo("Point-cloud scans received: %d", len(scans))
+            if len(scans) < int(param("min_lidar_scans", 20)):
+                raise RuntimeError("too few point-cloud scans for LiDAR motion estimation")
+            lidar_motion = estimate_lidar_motion(
+                scans,
+                voxel_size=float(param("lidar_voxel_size_m", 0.15)),
+                max_correspondence_m=float(param("lidar_max_correspondence_m", 2.0)),
+                max_iterations=int(param("lidar_icp_iterations", 20)),
+                min_correspondences=int(param("lidar_min_correspondences", 80)),
+                max_points=int(param("lidar_max_points_per_scan", 2500)),
+            )
+            rospy.loginfo(
+                "LiDAR motion samples: %d, rate %.2f Hz, mean ICP error %.4f m",
+                len(lidar_motion.timestamps),
+                lidar_motion.frequency_hz,
+                float(np.mean(lidar_motion.fitness)),
+            )
+            mean_icp_error = float(np.mean(lidar_motion.fitness))
+            max_icp_error = float(param("max_lidar_icp_error_m", 0.25))
+            if not np.isfinite(mean_icp_error) or mean_icp_error > max_icp_error:
+                raise RuntimeError(
+                    "point-cloud ICP error {:.3f} m exceeds {:.3f} m".format(mean_icp_error, max_icp_error)
+                )
+            mid_config = replace(
+                config,
+                body_gyro_scale=config.mid_gyro_scale,
+                body_accel_scale=config.mid_accel_scale,
+            )
+            mid_result = calibrate_lidar_body(lidar_motion, mid, mid_config)
+            body_result = calibrate_lidar_body(lidar_motion, body, config)
+            result = combine_lidar_sensor_results(mid_result, body_result, config)
+            result.pointcloud_motion_samples = len(lidar_motion.timestamps)
+            result.pointcloud_mean_icp_error_m = mean_icp_error
+        else:
+            if lidar_required:
+                raise RuntimeError("point-cloud calibration is required but use_pointcloud is false")
+            result = calibrate(mid, body, config)
     except Exception as exc:
-        rospy.logerr("标定失败: %s", exc)
+        rospy.logerr("Calibration failed: %s", exc)
         return 3
-    if bool(param("validate_split", True)):
+    if bool(param("validate_split", True)) and not use_pointcloud:
         try:
             rot_deg, trans_cm = _split_consistency(mid, body, config)
             result.split_half_rotation_deg = rot_deg
             result.split_half_translation_cm = trans_cm
-            rospy.loginfo("前后半段一致性: rotation=%.3f deg, translation=%.2f cm", rot_deg, trans_cm)
+            rospy.loginfo("Split-half consistency: rotation=%.3f deg, translation=%.2f cm", rot_deg, trans_cm)
             if rot_deg > 2.0:
                 result.notes.append("split-half rotation disagreement is above 2 deg")
             if trans_cm > 5.0:
@@ -214,12 +354,14 @@ def main() -> int:
             if rot_deg > 2.0 or trans_cm > 5.0:
                 result.accepted = False
         except Exception as exc:
-            rospy.logwarn("分段一致性检查跳过: %s", exc)
+            rospy.logwarn("Split-half validation skipped: %s", exc)
+    elif use_pointcloud:
+        result.notes.append("split-half IMU-only validation skipped in point-cloud mode to keep startup fast")
     write_result_yaml(output_yaml, result, config)
     write_result_txt(output_txt, result, config)
     rospy.loginfo("YAML: %s", output_yaml)
     rospy.loginfo("TXT: %s", output_txt)
-    rospy.loginfo("Mid360 相对 PX4 body (ENU): xyz=%s m, rpy=%s deg", result.as_yaml_dict(config)["mid360_relative_to_body_enu"]["translation_B_M_m"], result.as_yaml_dict(config)["mid360_relative_to_body_enu"]["rpy_B_M_deg"])
+    rospy.loginfo("Mid360 relative to PX4 body (ENU): xyz=%s m, rpy=%s deg", result.as_yaml_dict(config)["mid360_relative_to_body_enu"]["translation_B_M_m"], result.as_yaml_dict(config)["mid360_relative_to_body_enu"]["rpy_B_M_deg"])
     rospy.loginfo("gyro RMSE=%.4f, accel RMSE=%.4f, accepted=%s", result.gyro_stats.rmse, result.accel_stats.rmse, result.accepted)
     for note in result.notes:
         rospy.logwarn("quality note: %s", note)
