@@ -40,6 +40,8 @@ struct Result {
   double gyro_rmse = std::numeric_limits<double>::infinity();
   double accel_rmse = std::numeric_limits<double>::infinity();
   double icp_rmse = std::numeric_limits<double>::infinity();
+  double translation_condition = std::numeric_limits<double>::infinity();
+  double rotation_angle_deg = std::numeric_limits<double>::infinity();
   bool accepted = false;
   std::string note;
 };
@@ -52,6 +54,27 @@ static const char *MAGENTA = "\033[95m";
 static const char *RESET = "\033[0m";
 
 double clamp01(double v) { return std::max(0.0, std::min(1.0, v)); }
+
+Mat3 skew(const Vec3 &v) {
+  Mat3 m;
+  m << 0.0, -v.z(), v.y(),
+       v.z(), 0.0, -v.x(),
+       -v.y(), v.x(), 0.0;
+  return m;
+}
+
+Eigen::Vector3d rpyXyzDeg(const Mat3 &R) {
+  const double pitch = std::asin(std::max(-1.0, std::min(1.0, -R(2, 0))));
+  const double cp = std::cos(pitch);
+  double roll = 0.0, yaw = 0.0;
+  if (std::abs(cp) > 1.0e-8) {
+    roll = std::atan2(R(2, 1), R(2, 2));
+    yaw = std::atan2(R(1, 0), R(0, 0));
+  } else {
+    roll = std::atan2(-R(1, 2), R(1, 1));
+  }
+  return Eigen::Vector3d(roll, pitch, yaw) * 180.0 / M_PI;
+}
 
 void progress(const std::string &label, double value, const char *color, bool newline = true) {
   const int n = static_cast<int>(std::round(clamp01(value) * PB_WIDTH));
@@ -82,6 +105,7 @@ class Calibrator {
     pnh_.param("mid_gyro_scale", mid_gyro_scale_, 1.0);
     pnh_.param("body_gyro_scale", body_gyro_scale_, 1.0);
     pnh_.param("static_duration_s", static_s_, 5.0);
+    pnh_.param("static_validation_duration_s", static_validation_s_, 3.0);
     // Zero means wait indefinitely, like LI-Init's data sufficiency stage.
     // A positive value is an optional safety timeout and aborts calibration;
     // it never proceeds with insufficient motion data.
@@ -90,6 +114,7 @@ class Calibrator {
     pnh_.param("axis_excitation_target_rad", target_rad_, 1.2);
     pnh_.param("min_samples", min_samples_, 500);
     pnh_.param("min_lidar_scans", min_scans_, 15);
+    pnh_.param("max_lidar_scans", max_scans_, 1200);
     pnh_.param("lidar_voxel_size_m", voxel_, 0.20);
     pnh_.param("lidar_max_points_per_scan", max_points_, 1200);
     pnh_.param("lidar_max_correspondence_m", max_corr_, 2.0);
@@ -176,7 +201,7 @@ class Calibrator {
     } else return;
     if (!std::isfinite(scan.t) || scan.cloud->size() < 80) return;
     if (scan.cloud->size() > static_cast<size_t>(max_points_)) { pcl::PointCloud<pcl::PointXYZ>::Ptr reduced(new pcl::PointCloud<pcl::PointXYZ>()); const size_t step = scan.cloud->size() / max_points_ + 1; for (size_t i = 0; i < scan.cloud->size(); i += step) reduced->push_back((*scan.cloud)[i]); scan.cloud = reduced; }
-    std::lock_guard<std::mutex> lock(mutex_); scans_.push_back(scan); if (scans_.size() > 400) scans_.erase(scans_.begin(), scans_.begin() + (scans_.size() - 400));
+    std::lock_guard<std::mutex> lock(mutex_); scans_.push_back(scan); if (scans_.size() > static_cast<size_t>(max_scans_)) scans_.erase(scans_.begin(), scans_.begin() + (scans_.size() - max_scans_));
   }
 
   void spinFor(double seconds) {
@@ -262,7 +287,7 @@ class Calibrator {
     ROS_INFO("[Initialization] Data accumulation finished, LiDAR-IMU calibration begins.");
     return currentMidCount() >= static_cast<size_t>(min_samples_);
   }
-  void collectStaticValidation() { const ros::WallTime begin = ros::WallTime::now(); while (ros::ok() && (ros::WallTime::now()-begin).toSec() < 1.5) { const double f=(ros::WallTime::now()-begin).toSec()/1.5; progress("[Initialization] Static validation",f,f>=1?GREEN:YELLOW,true); spinFor(update_s_); } }
+  void collectStaticValidation() { const ros::WallTime begin = ros::WallTime::now(); while (ros::ok() && (ros::WallTime::now()-begin).toSec() < static_validation_s_) { const double f=(ros::WallTime::now()-begin).toSec()/static_validation_s_; progress("[Initialization] Static validation",f,f>=1?GREEN:YELLOW,true); spinFor(update_s_); } }
   size_t currentMidCount() { std::lock_guard<std::mutex> lock(mutex_); return mid_.size(); }
   double latestMidTime() { std::lock_guard<std::mutex> lock(mutex_); return mid_.empty() ? 0.0 : mid_.back().t; }
 
@@ -290,18 +315,66 @@ class Calibrator {
       pos=p_prev-R_prev*dR.transpose()*dt; const double dtm=scans[i].t-ts.back(); if(dtm<=1e-4) continue; ts.push_back(scans[i].t); rots.push_back(R); positions.push_back(pos); const Eigen::AngleAxisd aa(dR); omg.push_back(aa.angle()*aa.axis()/dtm); acc.push_back(Vec3::Zero()); icp_sum+=std::sqrt(score); ++icp_n; prev=scans[i].cloud; }
     if(ts.size()<5){ROS_ERROR("LiDAR ICP produced too few valid motions");return false;} for(size_t i=2;i<positions.size();++i){const double dtm=ts[i]-ts[i-1]; if(dtm>1e-4) acc[i]=(positions[i]-2*positions[i-1]+positions[i-2])/(dtm*dtm);} r.icp_rmse=icp_n?icp_sum/icp_n:1e9; stage("LiDAR motion estimation",1.0);
     stage("Temporal alignment",0.1); double best=time_min_, best_cost=1e99; for(double d=time_min_;d<=time_max_+0.5*time_step_;d+=time_step_){double c=0;int n=0; for(size_t i=1;i<ts.size();++i){Vec3 a=interp(body,ts[i]+d,true); Vec3 b=interp(mid,ts[i],true); c+=(a.norm()-b.norm())*(a.norm()-b.norm());++n;} if(n&&c/n<best_cost){best_cost=c/n;best=d;}} r.dt=best; stage("Temporal alignment",1.0);
-    stage("Rotation and gyro bias",0.1); Eigen::Matrix3d H=Mat3::Zero(); double gres=0; int gn=0; for(const auto&t:ts){Vec3 wm=interp(mid,t,true);Vec3 wb=interp(body,t+r.dt,true); if(wm.norm()<0.03||wb.norm()<0.03)continue; H+=wb*wm.transpose();++gn;} if(gn<20){ROS_ERROR("Insufficient rotational excitation");return false;} Eigen::JacobiSVD<Mat3> svd(H,Eigen::ComputeFullU|Eigen::ComputeFullV); r.R_B_M=svd.matrixU()*svd.matrixV().transpose(); if(r.R_B_M.determinant()<0){Mat3 U=svd.matrixU();U.col(2)*=-1;r.R_B_M=U*svd.matrixV().transpose();} for(const auto&t:ts){Vec3 e=interp(body,t+r.dt,true)-r.R_B_M*interp(mid,t,true);gres+=e.squaredNorm();} r.gyro_rmse=std::sqrt(gres/ts.size()); stage("Rotation and gyro bias",1.0);
-    stage("Translation / gravity refinement",0.1); Eigen::MatrixXd A(3*ts.size(),3); Eigen::VectorXd y(3*ts.size()); int row=0; double ares=0; for(const auto&t:ts){Vec3 wm=interp(mid,t,true), am=interp(mid,t,false), ab=interp(body,t+r.dt,false); Vec3 target=r.R_B_M*am-ab; Mat3 J=wm.squaredNorm()*Mat3::Identity()-wm*wm.transpose(); A.block<3,3>(row,0)=J; y.segment<3>(row)=target; row+=3;} if(row>=9){r.t_B_M=A.topRows(row).colPivHouseholderQr().solve(y.head(row));} for(const auto&t:ts){Vec3 wm=interp(mid,t,true), am=interp(mid,t,false), ab=interp(body,t+r.dt,false); Vec3 e=r.R_B_M*(am+(wm.cross(wm.cross(r.t_B_M))))-ab; ares+=e.squaredNorm();} r.accel_rmse=std::sqrt(ares/ts.size()); stage("Translation / gravity refinement",1.0);
-    stage("Validation",0.1); r.accepted=std::isfinite(r.gyro_rmse)&&std::isfinite(r.accel_rmse)&&r.gyro_rmse<0.35&&r.accel_rmse<3.0&&r.icp_rmse<max_icp_error_; r.note=r.accepted?"accepted":"residual or ICP quality is poor; collect stronger 3-axis excitation"; stage("Validation",1.0); return true;
+    stage("Rotation and gyro bias",0.1); Eigen::Matrix3d H=Mat3::Zero(); double gres=0; int gn=0; for(const auto&t:ts){Vec3 wm=interp(mid,t,true);Vec3 wb=interp(body,t+r.dt,true); if(wm.norm()<0.03||wb.norm()<0.03)continue; H+=wb*wm.transpose();++gn;} if(gn<20){ROS_ERROR("Insufficient rotational excitation");return false;}
+    // Add the static gravity direction as a second independent cue. This
+    // removes the common 180-degree ambiguity when the gyro excitation is
+    // noisy or concentrated around one axis.
+    if (mid_a0.norm() > 5.0 && body_a0.norm() > 5.0) {
+      H += 8.0 * (body_a0 / body_a0.norm()) * (mid_a0 / mid_a0.norm()).transpose();
+    }
+    Eigen::JacobiSVD<Mat3> svd(H,Eigen::ComputeFullU|Eigen::ComputeFullV);
+    const double rot_observability = svd.singularValues()(2) / std::max(svd.singularValues()(0), 1.0e-12);
+    if (rot_observability < 0.02) { ROS_ERROR("Rotation excitation is rank deficient (singular-value ratio %.4f); collect all three axes again.", rot_observability); return false; }
+    r.R_B_M=svd.matrixU()*svd.matrixV().transpose(); if(r.R_B_M.determinant()<0){Mat3 U=svd.matrixU();U.col(2)*=-1;r.R_B_M=U*svd.matrixV().transpose();} for(const auto&t:ts){Vec3 e=interp(body,t+r.dt,true)-r.R_B_M*interp(mid,t,true);gres+=e.squaredNorm();} r.gyro_rmse=std::sqrt(gres/ts.size()); stage("Rotation and gyro bias",1.0);
+    stage("Translation / gravity refinement",0.1);
+    // LI-Init convention: solve t_M_B in the Mid360 frame from
+    //     R_M_B * a_B - a_M = (alpha^ + omega^ omega^) t_M_B + bias,
+    // then convert to the requested position of the Mid360 origin in the
+    // PX4 body frame: p_M^B = -R_B_M * t_M_B.
+    const Mat3 R_M_B = r.R_B_M.transpose();
+    Eigen::MatrixXd A(3*ts.size(),6); Eigen::VectorXd y(3*ts.size()); int row=0;
+    const double alpha_dt = 0.01;
+    for (const auto &t : ts) {
+      const Vec3 wm = interp(mid,t,true);
+      const Vec3 alpha = (interp(mid,t + alpha_dt,true) - interp(mid,t - alpha_dt,true)) / (2.0 * alpha_dt);
+      const Vec3 am = interp(mid,t,false), ab = interp(body,t+r.dt,false);
+      const Mat3 J = skew(alpha) + skew(wm) * skew(wm);
+      A.block<3,3>(row,0) = J;
+      A.block<3,3>(row,3) = Mat3::Identity();
+      y.segment<3>(row) = R_M_B * ab - am;
+      row += 3;
+    }
+    const Eigen::JacobiSVD<Eigen::MatrixXd> trans_svd(A.leftCols(3), Eigen::ComputeThinU | Eigen::ComputeThinV);
+    const auto trans_sv = trans_svd.singularValues();
+    r.translation_condition = trans_sv.size() >= 3 && trans_sv(2) > 1.0e-9 ? trans_sv(0) / trans_sv(2) : std::numeric_limits<double>::infinity();
+    if (trans_sv.size() < 3 || trans_sv(2) < 1.0e-3) {
+      ROS_ERROR("Translation excitation is rank deficient; collect more varied angular acceleration.");
+      return false;
+    }
+    Eigen::VectorXd x = A.topRows(row).colPivHouseholderQr().solve(y.head(row));
+    const Vec3 t_M_B = x.head<3>();
+    r.t_B_M = -r.R_B_M * t_M_B;
+    double ares=0.0;
+    for (const auto &t : ts) {
+      const Vec3 wm = interp(mid,t,true);
+      const Vec3 alpha = (interp(mid,t + alpha_dt,true) - interp(mid,t - alpha_dt,true)) / (2.0 * alpha_dt);
+      const Vec3 am = interp(mid,t,false), ab = interp(body,t+r.dt,false);
+      const Vec3 e = (skew(alpha) + skew(wm) * skew(wm)) * t_M_B + x.tail<3>() - (R_M_B * ab - am);
+      ares += e.squaredNorm();
+    }
+    r.accel_rmse=std::sqrt(ares/std::max<size_t>(1,ts.size()));
+    stage("Translation / gravity refinement",1.0);
+    r.rotation_angle_deg = Eigen::AngleAxisd(r.R_B_M).angle() * 180.0 / M_PI;
+    stage("Validation",0.1); r.accepted=std::isfinite(r.gyro_rmse)&&std::isfinite(r.accel_rmse)&&r.gyro_rmse<0.12&&r.accel_rmse<1.0&&r.icp_rmse<max_icp_error_&&r.translation_condition<1.0e4; r.note=r.accepted?"accepted":"residual, observability, or ICP quality is poor; collect stronger 3-axis excitation"; stage("Validation",1.0); return true;
   }
 
   std::string path(const std::string &p) const { if(!p.empty()&&p[0]=='/') return p; return ros::package::getPath("mid360_px4_calibration")+"/"+p; }
   static std::string list3(const Vec3 &v) { std::ostringstream s; s << std::fixed << std::setprecision(9) << "[" << v.x() << ", " << v.y() << ", " << v.z() << "]"; return s.str(); }
-  void writeResults(const Result&r){const std::string y=path(output_yaml_), t=path(output_txt_); const Eigen::Vector3d e=r.R_B_M.eulerAngles(0,1,2)*180.0/M_PI; std::ofstream fy(y),ft(t); fy<<"mid360_relative_to_body_enu:\n  convention: T_B_M maps Mid360 sensor frame M to ROS base_link body frame B (FLU); ROS world convention is ENU\n  translation_B_M_m: "<<list3(r.t_B_M)<<"\n  rpy_B_M_deg: "<<list3(e)<<"\nquality:\n  dt_B_wrt_M_s: "<<r.dt<<"\n  gyro_rmse_rad_s: "<<r.gyro_rmse<<"\n  accel_rmse_m_s2: "<<r.accel_rmse<<"\n  pointcloud_mean_icp_error_m: "<<r.icp_rmse<<"\n  accepted: "<<(r.accepted?"true":"false")<<"\n  note: \""<<r.note<<"\"\n"; ft<<std::fixed<<std::setprecision(9)<<"Mid360 relative to PX4 body\nconvention: T_B_M maps Mid360 sensor frame M to ROS base_link body frame B (FLU); ROS world convention is ENU\ntranslation_B_M_m: "<<r.t_B_M.transpose()<<"\nrpy_B_M_deg: "<<e.transpose()<<"\ndt_B_wrt_M_s: "<<r.dt<<"\ngyro_rmse_rad_s: "<<r.gyro_rmse<<"\naccel_rmse_m_s2: "<<r.accel_rmse<<"\npointcloud_mean_icp_error_m: "<<r.icp_rmse<<"\naccepted: "<<(r.accepted?"true":"false")<<"\nnote: "<<r.note<<"\n"; ROS_INFO("Result YAML: %s",y.c_str()); ROS_INFO("Result TXT: %s",t.c_str()); }
-  void printResult(const Result&r){const Eigen::Vector3d e=r.R_B_M.eulerAngles(0,1,2)*180.0/M_PI; std::cout<<"\n"<<CYAN<<"[Init Result] "<<RESET<<"Translation Mid360 to PX4 body (base_link/FLU) = "<<r.t_B_M.transpose()<<" m\n"<<CYAN<<"[Init Result] "<<RESET<<"RPY Mid360 to body (ROS ENU-side, XYZ) = "<<e.transpose()<<" deg\n"<<GREEN<<"[Init Result] "<<RESET<<"accepted="<<(r.accepted?"true":"false")<<", gyro RMSE="<<r.gyro_rmse<<", accel RMSE="<<r.accel_rmse<<"\n"; }
+  void writeResults(const Result&r){const std::string y=path(output_yaml_), t=path(output_txt_); const Eigen::Vector3d e=rpyXyzDeg(r.R_B_M); std::ofstream fy(y),ft(t); fy<<"mid360_relative_to_body_enu:\n  convention: T_B_M maps Mid360 sensor frame M to ROS base_link body frame B (FLU); ROS world convention is ENU\n  translation_B_M_m: "<<list3(r.t_B_M)<<"\n  rpy_B_M_deg: "<<list3(e)<<"\nquality:\n  dt_B_wrt_M_s: "<<r.dt<<"\n  gyro_rmse_rad_s: "<<r.gyro_rmse<<"\n  accel_rmse_m_s2: "<<r.accel_rmse<<"\n  pointcloud_mean_icp_error_m: "<<r.icp_rmse<<"\n  rotation_angle_deg: "<<r.rotation_angle_deg<<"\n  translation_condition_number: "<<r.translation_condition<<"\n  accepted: "<<(r.accepted?"true":"false")<<"\n  note: \""<<r.note<<"\"\n"; ft<<std::fixed<<std::setprecision(9)<<"Mid360 relative to PX4 body\nconvention: T_B_M maps Mid360 sensor frame M to ROS base_link body frame B (FLU); ROS world convention is ENU\ntranslation_B_M_m: "<<r.t_B_M.transpose()<<"\nrpy_B_M_deg: "<<e.transpose()<<"\ndt_B_wrt_M_s: "<<r.dt<<"\ngyro_rmse_rad_s: "<<r.gyro_rmse<<"\naccel_rmse_m_s2: "<<r.accel_rmse<<"\npointcloud_mean_icp_error_m: "<<r.icp_rmse<<"\nrotation_angle_deg: "<<r.rotation_angle_deg<<"\ntranslation_condition_number: "<<r.translation_condition<<"\naccepted: "<<(r.accepted?"true":"false")<<"\nnote: "<<r.note<<"\n"; ROS_INFO("Result YAML: %s",y.c_str()); ROS_INFO("Result TXT: %s",t.c_str()); }
+  void printResult(const Result&r){const Eigen::Vector3d e=rpyXyzDeg(r.R_B_M); std::cout<<"\n"<<CYAN<<"[Init Result] "<<RESET<<"Translation Mid360 to PX4 body (base_link/FLU) = "<<r.t_B_M.transpose()<<" m\n"<<CYAN<<"[Init Result] "<<RESET<<"RPY Mid360 to body (XYZ, canonical branch) = "<<e.transpose()<<" deg\n"<<GREEN<<"[Init Result] "<<RESET<<"accepted="<<(r.accepted?"true":"false")<<", rotation angle="<<r.rotation_angle_deg<<" deg, gyro RMSE="<<r.gyro_rmse<<", accel RMSE="<<r.accel_rmse<<"\n"; }
 
   ros::NodeHandle nh_,pnh_; ros::Subscriber mid_sub_,body_sub_,cloud_sub_; std::mutex mutex_; std::vector<ImuSample> mid_,body_; std::vector<Scan> scans_;
-  std::string mid_topic_,body_topic_,lidar_topic_,output_yaml_,output_txt_,mid_frame_id_,body_frame_id_; double mid_accel_scale_,body_accel_scale_,mid_gyro_scale_,body_gyro_scale_,static_s_,motion_timeout_s_,update_s_,target_rad_,voxel_,max_corr_,max_icp_error_,time_min_,time_max_,time_step_; int min_samples_,min_scans_,max_points_,icp_iterations_; bool ansi_;
+  std::string mid_topic_,body_topic_,lidar_topic_,output_yaml_,output_txt_,mid_frame_id_,body_frame_id_; double mid_accel_scale_,body_accel_scale_,mid_gyro_scale_,body_gyro_scale_,static_s_,static_validation_s_,motion_timeout_s_,update_s_,target_rad_,voxel_,max_corr_,max_icp_error_,time_min_,time_max_,time_step_; int min_samples_,min_scans_,max_scans_,max_points_,icp_iterations_; bool ansi_;
 };
 }
 

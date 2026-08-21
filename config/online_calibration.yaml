@@ -24,12 +24,14 @@ output_txt: "config/online_calibration_result.txt"
 # sequential excitation stages. X reaches 100% before Y starts, and Y reaches
 # 100% before Z starts. The default timeout is zero: wait indefinitely instead
 # of running a calibration with insufficient motion.
-static_duration_s: 5.0
+static_duration_s: 8.0
+static_validation_duration_s: 3.0
 motion_timeout_s: 0.0
 motion_update_period_s: 0.25
-axis_excitation_target_rad: 1.2
-min_samples: 500
-min_lidar_scans: 15
+axis_excitation_target_rad: 2.5
+min_samples: 1500
+min_lidar_scans: 30
+max_lidar_scans: 1200
 lidar_voxel_size_m: 0.20
 lidar_max_correspondence_m: 2.0
 lidar_icp_iterations: 12

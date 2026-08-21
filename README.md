@@ -47,7 +47,7 @@ Edit `config/online_calibration.yaml`, then run:
 roslaunch mid360_px4_calibration online_calibration.launch
 ```
 
-The terminal displays three excitation bars. After the static stage, it asks for roll (X), then pitch (Y), then yaw (Z). The next step is not entered until the current bar reaches 100%. With the default `motion_timeout_s: 0.0`, the node waits indefinitely if the device is not moved; it never proceeds with insufficient motion data. Use Ctrl+C to abort. A static, geometrically rich scene is required for ICP; avoid blank walls and moving objects.
+The terminal displays three excitation bars. After the static stage, it asks for roll (X), then pitch (Y), then yaw (Z). The next step is not entered until the current bar reaches 100%. The default collection is intentionally longer: 8 seconds static, 2.5 rad accumulated excitation per axis, at least 1500 IMU samples, and 30 valid LiDAR scans. With `motion_timeout_s: 0.0`, the node waits indefinitely if the device is not moved; it never proceeds with insufficient motion data. Use Ctrl+C to abort. A static, geometrically rich scene is required for ICP; avoid blank walls and moving objects.
 
 Results are written under the package directory by default:
 
