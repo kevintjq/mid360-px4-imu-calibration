@@ -10,6 +10,8 @@ from __future__ import annotations
 import sys
 import threading
 import time
+import importlib
+import struct
 from dataclasses import replace
 from typing import List, Tuple
 
@@ -93,9 +95,28 @@ class PointCloudBuffer:
 def _decode_point_cloud(msg) -> PointCloudScan:
     connection_header = getattr(msg, "_connection_header", {}) or {}
     type_name = connection_header.get("type", "")
-    msg_class = roslib.message.get_message_class(type_name)
+    try:
+        msg_class = roslib.message.get_message_class(type_name)
+    except Exception:
+        msg_class = None
+    if msg_class is None and "/" in type_name:
+        # Some vendor message packages (notably livox_ros_driver2) are not
+        # discoverable through roslib's cache until their Python module is
+        # imported explicitly, even though rospy can subscribe to the topic.
+        package_name, message_name = type_name.split("/", 1)
+        try:
+            message_module = importlib.import_module(package_name + ".msg")
+            msg_class = getattr(message_module, message_name, None)
+        except (ImportError, AttributeError):
+            msg_class = None
     if msg_class is None:
-        raise ValueError("unsupported point-cloud message type: {}".format(type_name))
+        if type_name in ("livox_ros_driver2/CustomMsg", "livox_ros_driver/CustomMsg"):
+            return _decode_livox_custom_msg_raw(msg)
+        raise ValueError(
+            "unsupported point-cloud message type: {} (source the Livox driver2 workspace so its Python message package is available)".format(
+                type_name
+            )
+        )
     decoded = msg_class()
     decoded.deserialize(msg._buff)
     header = getattr(decoded, "header", None)
@@ -126,6 +147,56 @@ def _decode_point_cloud(msg) -> PointCloudScan:
     if len(points) > 4000:
         points = points[:: max(1, len(points) // 4000)]
     return PointCloudScan(float(timestamp), points, frame_id)
+
+
+def _decode_livox_custom_msg_raw(msg) -> PointCloudScan:
+    """Decode Livox CustomMsg without importing the vendor Python package.
+
+    ROS1 serialization is little-endian.  CustomMsg contains a standard
+    Header, timebase, point_num, lidar_id, three reserved bytes, and a
+    variable-length CustomPoint array.  This fallback is useful when the
+    driver publishes the topic but its generated Python message package was
+    not sourced into the current workspace.
+    """
+    data = memoryview(bytes(msg._buff))
+    offset = 0
+
+    def unpack(fmt: str):
+        nonlocal offset
+        size = struct.calcsize(fmt)
+        if offset + size > len(data):
+            raise ValueError("truncated Livox CustomMsg")
+        values = struct.unpack_from(fmt, data, offset)
+        offset += size
+        return values
+
+    _seq = unpack("<I")[0]
+    sec, nsec = unpack("<II")
+    frame_len = unpack("<I")[0]
+    if offset + frame_len > len(data):
+        raise ValueError("truncated Livox frame_id")
+    frame_id = bytes(data[offset : offset + frame_len]).decode("utf-8", errors="replace")
+    offset += frame_len
+    timebase = unpack("<Q")[0]
+    point_num = unpack("<I")[0]
+    _lidar_id = unpack("<B")[0]
+    unpack("<3B")
+    array_len = unpack("<I")[0]
+    count = min(int(point_num), int(array_len))
+    points = np.empty((count, 3), dtype=float)
+    for index in range(int(array_len)):
+        _offset_time = unpack("<I")[0]
+        x, y, z = unpack("<fff")
+        unpack("<3B")
+        if index < count:
+            points[index] = (x, y, z)
+    points = points[np.all(np.isfinite(points), axis=1)]
+    timestamp = float(sec) + float(nsec) * 1.0e-9
+    if timestamp <= 0.0:
+        timestamp = float(timebase) * 1.0e-9
+    if timestamp <= 0.0 or not np.isfinite(timestamp):
+        raise ValueError("Livox CustomMsg has no valid timestamp")
+    return PointCloudScan(timestamp, points, frame_id)
 
 
 def _to_samples(items: List[Tuple[float, np.ndarray, np.ndarray, str]]) -> ImuSamples:
