@@ -1,10 +1,7 @@
-# Online calibration reads these two sensor_msgs/Imu topics directly.
+# C++ LI-Init-style online calibration parameters.
 mid_imu_topic: "/livox/imu"
 body_imu_topic: "/mavros/imu/data_raw"
 lidar_topic: "/livox/lidar"
-use_pointcloud: true
-lidar_required: true
-stamp_source: "header"
 
 # Convert raw topic units to SI units before calibration.
 # Use 9.80665 if the corresponding accelerometer publishes in g.
@@ -19,38 +16,21 @@ body_gyro_scale: 1.0
 output_yaml: "config/online_calibration_result.yaml"
 output_txt: "config/online_calibration_result.txt"
 
-# The operator is guided through these phases in the terminal.
-interactive_prompts: true
-phase_duration_s: 4.0
-static_duration_s: 2.5
+# LI-Init-style automatic collection: initial static period, then motion
+# accumulation until all three axes are sufficiently excited or timeout.
+static_duration_s: 5.0
+motion_max_duration_s: 22.0
+motion_update_period_s: 0.25
+axis_excitation_target_rad: 1.2
 min_samples: 500
-validate_split: true
-max_lidar_scans: 300
 min_lidar_scans: 15
 lidar_voxel_size_m: 0.20
 lidar_max_correspondence_m: 2.0
-lidar_icp_iterations: 8
-lidar_min_correspondences: 40
+lidar_icp_iterations: 12
 lidar_max_points_per_scan: 1200
 max_lidar_icp_error_m: 0.25
 
 time_search_min_s: -0.5
 time_search_max_s: 0.5
-# Grid step used for the initial time-offset search. The nonlinear stage
-# refines the final value continuously.
-time_search_step_s: 0.001
-
-max_samples: 12000
-filter_window_s: 0.08
-filter_polyorder: 3
-trim_s: 0.5
-
-gyro_sigma_rad_s: 0.03
-accel_sigma_m_s2: 0.2
-robust_loss: "soft_l1"
-
-accepted_gyro_rmse_rad_s: 0.12
-accepted_accel_rmse_m_s2: 0.8
-min_rotation_eigenvalue: 0.001
-min_translation_eigenvalue: 0.001
-max_translation_condition_number: 1000000.0
+time_search_step_s: 0.005
+use_ansi_progress: true
