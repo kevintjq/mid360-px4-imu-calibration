@@ -1,36 +1,19 @@
-# Mid360/PX4 Offline Dual-IMU Extrinsic Calibration
+# Mid360/PX4 Online Dual-IMU Extrinsic Calibration
 
 English | [中文](README_CN.md)
 
-This is a ROS1 catkin package that only reads Mid360 IMU and PX4/MAVROS IMU topics from a rosbag, computes offline calibration parameters, and writes `yaml` and `txt` result files. It does not publish MAVROS topics.
+This ROS1 catkin package estimates the rigid extrinsic calibration between a Livox Mid360 IMU and a PX4/MAVROS body IMU. The recommended workflow is **online calibration**: the node subscribes directly to two `sensor_msgs/Imu` topics, guides the operator through a sequence of motions, computes the result, and writes YAML/TXT files. It does not publish any ROS topic.
 
-## Input
+The original rosbag workflow is still available for repeatable offline experiments.
 
-The offline calibration node reads two `sensor_msgs/Imu` topics from a ROS1 bag:
+## What is estimated
 
-- Mid360 IMU, for example `/livox/imu`
-- PX4/MAVROS IMU, for example `/mavros/imu/data`
+- time offset `dt_B_wrt_M`;
+- rotation and translation between the two IMU frames;
+- combined gyro and accelerometer biases;
+- residuals, observability eigenvalues, condition number, and acceptance status.
 
-Angular velocity should be in `rad/s`; acceleration should be in `m/s^2`.
-
-## Output
-
-Default outputs are written under this package's `config/` directory:
-
-- `config/calibration_result.yaml`: structured result for later programmatic use;
-- `config/calibration_result.txt`: human-readable result for inspection and logs.
-
-Result convention:
-
-```text
-T_M_B maps PX4 body B to Mid360 frame M
-T_W_B = T_W_M * T_M_B
-t_B = t_M + dt_B_wrt_M
-```
-
-`translation_M_B_m` is the PX4 body/IMU origin expressed in the Mid360 `M` frame.
-
-For direct inspection of the Mid360 offset relative to the flight-controller body, the result also includes:
+The result includes the requested ENU-side representation:
 
 ```yaml
 mid360_relative_to_body_enu:
@@ -38,64 +21,92 @@ mid360_relative_to_body_enu:
   rpy_B_M_deg: [roll, pitch, yaw]
 ```
 
-This is `T_B_M`, the Mid360 frame relative to the PX4 body frame, expressed with ROS/MAVROS ENU-side semantics and no NED/FRD conversion.
+Here `T_B_M` maps Mid360 frame `M` to PX4 body frame `B`. The output uses the ROS/MAVROS-side ENU convention; it does not silently apply an extra NED/FRD conversion.
 
-## Build
+## Important accuracy limitation
 
-Place this package under `catkin_ws/src`:
+Rotation is usually better constrained than the XYZ lever arm. The lever arm is only observable through angular acceleration and centripetal acceleration, so static data or one-axis constant-rate motion cannot determine it reliably. The online procedure therefore includes:
+
+1. a static period for bias/noise characterization;
+2. separate positive/negative rotations around X, Y, and Z;
+3. a combined multi-axis motion with changing angular speed;
+4. a final static period;
+5. an optional split-half consistency check.
+
+Do not accept XYZ only because the process finished. Check `accepted`, acceleration RMSE, translation condition number, and the split-half disagreement. If the result is unstable, repeat with slower, larger, multi-axis rotations and a rigid sensor mount.
+
+## Topics and units
+
+The node reads only:
+
+- Mid360 IMU: default `/livox/imu`;
+- PX4/MAVROS IMU: default `/mavros/imu/data`.
+
+Both must be `sensor_msgs/Imu`. Angular velocity must be `rad/s` and linear acceleration must be `m/s^2`. The node uses `header.stamp` and automatically copies non-empty `header.frame_id` values into the result.
+
+## Ubuntu 20.04 / ROS Noetic build
 
 ```bash
-cd ~/catkin_ws
+sudo apt update
+sudo apt install python3-numpy python3-scipy python3-yaml python3-rospkg ros-noetic-rosbag ros-noetic-sensor-msgs
+mkdir -p ~/catkin_ws/src
+cd ~/catkin_ws/src
+git clone https://github.com/kevintjq/mid360-px4-imu-calibration.git
+cd ..
 catkin_make
 source devel/setup.bash
 ```
 
-Dependencies:
+## Recommended online calibration
 
-```bash
-sudo apt install python3-numpy python3-scipy python3-yaml python3-rospkg ros-noetic-rosbag
-```
-
-## Configure
-
-Edit `config/offline_calibration.yaml`:
+Edit [config/online_calibration.yaml](config/online_calibration.yaml):
 
 ```yaml
-bag_path: "/path/to/calibration.bag"
 mid_imu_topic: "/livox/imu"
 body_imu_topic: "/mavros/imu/data"
-stamp_source: "header"
-
-output_yaml: "config/calibration_result.yaml"
-output_txt: "config/calibration_result.txt"
+output_yaml: "config/online_calibration_result.yaml"
+output_txt: "config/online_calibration_result.txt"
+interactive_prompts: true
+phase_duration_s: 15.0
+static_duration_s: 5.0
+validate_split: true
 ```
 
-Relative paths are resolved under this ROS package; absolute paths are used as-is.
+Start it while both IMU topics are being published:
 
-`mid_frame` and `body_frame` do not need to be configured manually. The node reads them from each IMU topic's `header.frame_id` in the rosbag and writes them to the result files. If a topic has an empty `frame_id`, the internal default name is used as a fallback.
+```bash
+roslaunch mid360_px4_calibration online_calibration.launch
+```
 
-## Launch
+Follow the terminal prompts. Keep the complete rigid assembly in your hand or on the vehicle; do not translate it independently. During the X/Y/Z phases, rotate in both directions. During the combined phase, vary the angular speed and excite all three axes.
+
+The node writes:
+
+- `config/online_calibration_result.yaml`;
+- `config/online_calibration_result.txt`.
+
+Set absolute output paths if the package directory is not writable.
+
+## Offline rosbag mode
+
+Configure [config/offline_calibration.yaml](config/offline_calibration.yaml) with a bag path and the same two IMU topics, then run:
 
 ```bash
 roslaunch mid360_px4_calibration offline_calibration.launch
 ```
 
-You can also pass another YAML file:
-
-```bash
-roslaunch mid360_px4_calibration offline_calibration.launch config:=/path/to/offline_calibration.yaml
-```
-
-## What It Computes
-
-- normalized correlation estimate of `dt_B_wrt_M`
-- Wahba/SVD rotation initialization
-- nonlinear refinement of rotation, time offset, and combined gyro bias
-- robust IRLS solve for lever arm and combined accelerometer bias
-- residual statistics, observability eigenvalues, and acceptance status
+The bag must contain both `sensor_msgs/Imu` topics with valid timestamps and overlapping time ranges. Odometry is not required and no output topic is published.
 
 ## Tests
+
+The numerical tests do not require ROS:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+The project must be built and run on Ubuntu 20.04/ROS Noetic for ROS-level validation; the Windows development environment cannot run `catkin_make` or `roslaunch`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

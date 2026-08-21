@@ -108,6 +108,8 @@ def write_result_txt(path: Union[str, Path], result: Any, config: CalibrationCon
                 _fmt_list(quality["translation_information_eigenvalues"], 9)
             ),
             "  translation_condition_number: {:.9f}".format(quality["translation_condition_number"]),
+            "  split_half_rotation_deg: {}".format(_fmt_optional(quality["split_half_rotation_deg"], 6)),
+            "  split_half_translation_cm: {}".format(_fmt_optional(quality["split_half_translation_cm"], 6)),
             "  accepted: {}".format(quality["accepted"]),
         ]
     )
@@ -123,3 +125,9 @@ def write_result_txt(path: Union[str, Path], result: Any, config: CalibrationCon
 
 def _fmt_list(values: Any, precision: int) -> str:
     return "[" + ", ".join(("{:." + str(precision) + "f}").format(float(v)) for v in values) + "]"
+
+
+def _fmt_optional(value: Any, precision: int) -> str:
+    if value is None:
+        return "null"
+    return ("{: ." + str(precision) + "f}").format(float(value)).strip()

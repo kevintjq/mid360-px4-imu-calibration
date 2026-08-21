@@ -1,36 +1,19 @@
-# Mid360/PX4 离线双 IMU 外参标定
+# Mid360/PX4 在线双 IMU 外参标定
 
 [English](README.md) | 中文
 
-这是一个 ROS1 catkin 工程，只负责从 rosbag 读取 Mid360 IMU 和 PX4/MAVROS IMU 话题，离线计算外参参数，并把结果写成 `yaml` 和 `txt`。本工程不发布 MAVROS 话题。
+这是一个 ROS1 catkin 工程，用于计算 Livox Mid360 IMU 与 PX4/MAVROS 飞控 body IMU 之间的刚性外参。推荐使用**在线标定**：节点直接订阅两个 `sensor_msgs/Imu` 话题，在终端提示操作者按阶段运动，计算完成后写出 YAML/TXT 结果。节点不会发布任何 ROS 话题。
 
-## 输入
+原有 rosbag 离线流程仍然保留，方便重复实验和复现。
 
-离线标定节点读取 ROS1 bag 里的两个 `sensor_msgs/Imu` 话题：
+## 标定内容
 
-- Mid360 IMU，例如 `/livox/imu`
-- PX4/MAVROS IMU，例如 `/mavros/imu/data`
+- 时间偏移 `dt_B_wrt_M`；
+- 两个 IMU 坐标系之间的旋转和平移；
+- 合并后的陀螺仪和加速度计偏置；
+- 残差、可观测性特征值、条件数和是否通过质量检查。
 
-角速度单位应为 `rad/s`，加速度单位应为 `m/s^2`。
-
-## 输出
-
-默认输出在本工程 `config/` 目录：
-
-- `config/calibration_result.yaml`：结构化结果，适合后续程序读取；
-- `config/calibration_result.txt`：人可读结果，适合现场查看和记录。
-
-结果约定：
-
-```text
-T_M_B maps PX4 body B to Mid360 frame M
-T_W_B = T_W_M * T_M_B
-t_B = t_M + dt_B_wrt_M
-```
-
-其中 `translation_M_B_m` 是 PX4 body/IMU 原点在 Mid360 `M` 系中的坐标。
-
-为了方便直接查看 Mid360 相对飞控 body 的偏移，结果里还会额外输出：
+结果包含你要求的 ENU 侧表示：
 
 ```yaml
 mid360_relative_to_body_enu:
@@ -38,64 +21,92 @@ mid360_relative_to_body_enu:
   rpy_B_M_deg: [roll, pitch, yaw]
 ```
 
-这部分是 `T_B_M`，表示 Mid360 相对 PX4 body 的 XYZ 和 RPY，按 ROS/MAVROS 侧 ENU 语义输出，不做 NED/FRD 转换。
+这里的 `T_B_M` 表示把 Mid360 坐标系 `M` 映射到 PX4 body 坐标系 `B`。输出采用 ROS/MAVROS 侧 ENU 语义，不会偷偷再做一次 NED/FRD 转换。
 
-## 编译
+## 为什么在线流程能改善误差
 
-把工程放到 `catkin_ws/src` 下：
+XYZ 杆臂通常比旋转更难标定。杆臂只通过角加速度和向心加速度产生的差异可观测；静止数据或单轴匀速转动不能可靠确定 XYZ。因此在线流程固定包含：
+
+1. 静止阶段，用于观察偏置和噪声；
+2. 分别绕 X、Y、Z 轴正反转；
+3. 三轴组合运动，并改变转动速度；
+4. 最后静止；
+5. 可选的前后半段一致性检查。
+
+不要因为程序运行结束就直接接受 XYZ。必须查看 `accepted`、加速度 RMSE、translation condition number 以及前后半段差异。如果结果不稳定，请用更慢、更大幅度的三轴运动重复采集，并确保两个 IMU 刚性固定。
+
+## 读取的话题和单位
+
+节点只读取以下两个话题：
+
+- Mid360 IMU：默认 `/livox/imu`；
+- PX4/MAVROS IMU：默认 `/mavros/imu/data`。
+
+两个话题都必须是 `sensor_msgs/Imu`。角速度单位必须是 `rad/s`，线加速度单位必须是 `m/s^2`。节点使用 `header.stamp`，并自动读取非空的 `header.frame_id` 写入结果。
+
+## Ubuntu 20.04 / ROS Noetic 编译
 
 ```bash
-cd ~/catkin_ws
+sudo apt update
+sudo apt install python3-numpy python3-scipy python3-yaml python3-rospkg ros-noetic-rosbag ros-noetic-sensor-msgs
+mkdir -p ~/catkin_ws/src
+cd ~/catkin_ws/src
+git clone https://github.com/kevintjq/mid360-px4-imu-calibration.git
+cd ..
 catkin_make
 source devel/setup.bash
 ```
 
-依赖：
+## 推荐：在线标定
 
-```bash
-sudo apt install python3-numpy python3-scipy python3-yaml python3-rospkg ros-noetic-rosbag
-```
-
-## 配置
-
-修改工程内的 `config/offline_calibration.yaml`：
+编辑 [config/online_calibration.yaml](config/online_calibration.yaml)：
 
 ```yaml
-bag_path: "/path/to/calibration.bag"
 mid_imu_topic: "/livox/imu"
 body_imu_topic: "/mavros/imu/data"
-stamp_source: "header"
-
-output_yaml: "config/calibration_result.yaml"
-output_txt: "config/calibration_result.txt"
+output_yaml: "config/online_calibration_result.yaml"
+output_txt: "config/online_calibration_result.txt"
+interactive_prompts: true
+phase_duration_s: 15.0
+static_duration_s: 5.0
+validate_split: true
 ```
 
-相对路径会按本 ROS 包目录解析；绝对路径会原样使用。
+在两个 IMU 话题都已经发布时启动：
 
-`mid_frame` 和 `body_frame` 不需要手动填写，节点会从 rosbag 中两个 IMU 话题的 `header.frame_id` 读取并写入结果文件。如果某个话题的 `frame_id` 为空，程序才会使用内部默认名称兜底。
+```bash
+roslaunch mid360_px4_calibration online_calibration.launch
+```
 
-## 启动
+按照终端提示操作。整个 Mid360、飞控和安装结构必须保持刚性，不要单独平移某个传感器。X/Y/Z 阶段都要正反转；组合阶段要改变角速度并尽量激励三轴。
+
+节点默认写出：
+
+- `config/online_calibration_result.yaml`；
+- `config/online_calibration_result.txt`。
+
+如果工程目录不可写，请把输出改成绝对路径。
+
+## rosbag 离线模式
+
+编辑 [config/offline_calibration.yaml](config/offline_calibration.yaml)，填写 bag 路径和同样的两个 IMU 话题，然后运行：
 
 ```bash
 roslaunch mid360_px4_calibration offline_calibration.launch
 ```
 
-也可以指定另一份 YAML：
-
-```bash
-roslaunch mid360_px4_calibration offline_calibration.launch config:=/path/to/offline_calibration.yaml
-```
-
-## 当前计算内容
-
-- 归一化互相关估计 `dt_B_wrt_M`
-- Wahba/SVD 旋转初值
-- 非线性细化旋转、时间偏移和陀螺组合偏置
-- 鲁棒 IRLS 求解杆臂和平移加速度组合偏置
-- 输出残差统计、可观性特征值和验收状态
+bag 必须包含两个带有效时间戳且时间范围有重叠的 `sensor_msgs/Imu` 话题。不需要 odom，程序也不会发布输出话题。
 
 ## 测试
+
+数值测试不依赖 ROS：
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+ROS 级别必须在 Ubuntu 20.04/ROS Noetic 上用 `catkin_make` 和 `roslaunch` 验证；Windows 开发环境不能替代这一步。
+
+## 许可证
+
+MIT，见 [LICENSE](LICENSE)。

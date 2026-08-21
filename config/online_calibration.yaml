@@ -1,0 +1,36 @@
+# Online calibration reads these two sensor_msgs/Imu topics directly.
+mid_imu_topic: "/livox/imu"
+body_imu_topic: "/mavros/imu/data"
+stamp_source: "header"
+
+# Output paths are relative to this package unless absolute paths are used.
+output_yaml: "config/online_calibration_result.yaml"
+output_txt: "config/online_calibration_result.txt"
+
+# The operator is guided through these phases in the terminal.
+interactive_prompts: true
+phase_duration_s: 15.0
+static_duration_s: 5.0
+min_samples: 500
+validate_split: true
+
+time_search_min_s: -0.5
+time_search_max_s: 0.5
+# Grid step used for the initial time-offset search. The nonlinear stage
+# refines the final value continuously.
+time_search_step_s: 0.001
+
+max_samples: 12000
+filter_window_s: 0.08
+filter_polyorder: 3
+trim_s: 0.5
+
+gyro_sigma_rad_s: 0.03
+accel_sigma_m_s2: 0.2
+robust_loss: "soft_l1"
+
+accepted_gyro_rmse_rad_s: 0.12
+accepted_accel_rmse_m_s2: 0.8
+min_rotation_eigenvalue: 0.001
+min_translation_eigenvalue: 0.001
+max_translation_condition_number: 1000000.0

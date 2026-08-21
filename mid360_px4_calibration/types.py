@@ -125,6 +125,8 @@ class CalibrationResult:
     rotation_observability_eigenvalues: np.ndarray
     accepted: bool
     notes: List[str] = field(default_factory=list)
+    split_half_rotation_deg: Optional[float] = None
+    split_half_translation_cm: Optional[float] = None
 
     def as_yaml_dict(self, config: CalibrationConfig) -> Dict[str, Any]:
         from scipy.spatial.transform import Rotation
@@ -182,6 +184,12 @@ class CalibrationResult:
                 "rotation_information_eigenvalues": [float(v) for v in self.rotation_observability_eigenvalues],
                 "translation_information_eigenvalues": [float(v) for v in self.translation_information_eigenvalues],
                 "translation_condition_number": float(self.translation_condition_number),
+                "split_half_rotation_deg": None
+                if self.split_half_rotation_deg is None
+                else float(self.split_half_rotation_deg),
+                "split_half_translation_cm": None
+                if self.split_half_translation_cm is None
+                else float(self.split_half_translation_cm),
                 "accepted": bool(self.accepted),
                 "notes": list(self.notes),
             },

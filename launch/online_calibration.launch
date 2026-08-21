@@ -1,0 +1,10 @@
+<launch>
+  <arg name="config" default="$(find mid360_px4_calibration)/config/online_calibration.yaml"/>
+
+  <node pkg="mid360_px4_calibration"
+        type="online_calibration_node.py"
+        name="mid360_px4_online_calibration"
+        output="screen">
+    <rosparam file="$(arg config)" command="load"/>
+  </node>
+</launch>

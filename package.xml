@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <package format="2">
   <name>mid360_px4_calibration</name>
-  <version>0.1.0</version>
-  <description>Offline Mid360/PX4 dual-IMU extrinsic calibration and odometry transform nodes.</description>
+  <version>0.2.0</version>
+  <description>Online and offline Mid360/PX4 dual-IMU extrinsic calibration from sensor_msgs/Imu topics.</description>
 
   <maintainer email="kevintjq@users.noreply.github.com">kevintjq</maintainer>
   <license>MIT</license>

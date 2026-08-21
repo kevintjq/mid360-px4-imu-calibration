@@ -12,6 +12,7 @@ catkin_package()
 
 catkin_install_python(PROGRAMS
   scripts/offline_calibration_node.py
+  scripts/online_calibration_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
