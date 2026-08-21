@@ -7,7 +7,7 @@
 整体流程参考 [HKU-MaRS LiDAR_IMU_Init](https://github.com/hku-mars/LiDAR_IMU_Init)：
 
 1. 启动后先保持整套刚性组件静止；
-2. 根据 roll、pitch、yaw 三轴激励程度自动判断数据是否足够；
+2. 按 roll、pitch、yaw 顺序分三个阶段采集激励；当前进度条达到 100% 后才进入下一个轴；
 3. 使用点云 ICP 估计 LiDAR 扫描间运动；
 4. 搜索 IMU 时间偏移，依次求解旋转和平移杆臂；
 5. 做残差和 ICP 质量检查，并用进度条显示各阶段状态。
@@ -47,7 +47,7 @@ source devel/setup.bash
 roslaunch mid360_px4_calibration online_calibration.launch
 ```
 
-终端会显示三个激励进度条。保持 Mid360、两个 IMU 以及安装支架刚性固定，根据提示优先缓慢做激励最不足的轴：roll（X）、pitch（Y）、yaw（Z），并改变转动方向。点云环境需要静止且有足够几何结构，避免空白墙面和移动物体。
+终端会显示三个激励进度条。静止阶段结束后，程序依次提示 roll（X）、pitch（Y）、yaw（Z）；当前轴的进度条没有达到 100% 时不会进入下一步。默认 `motion_timeout_s: 0.0` 表示无限等待，设备不动时程序不会带着不足数据结束；如需退出请按 Ctrl+C。点云环境需要静止且有足够几何结构，避免空白墙面和移动物体。
 
 默认结果写入工程目录：
 

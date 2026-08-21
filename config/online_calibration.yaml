@@ -16,10 +16,12 @@ body_gyro_scale: 1.0
 output_yaml: "config/online_calibration_result.yaml"
 output_txt: "config/online_calibration_result.txt"
 
-# LI-Init-style automatic collection: initial static period, then motion
-# accumulation until all three axes are sufficiently excited or timeout.
+# LI-Init-style automatic collection: initial static period, then three
+# sequential excitation stages. X reaches 100% before Y starts, and Y reaches
+# 100% before Z starts. The default timeout is zero: wait indefinitely instead
+# of running a calibration with insufficient motion.
 static_duration_s: 5.0
-motion_max_duration_s: 22.0
+motion_timeout_s: 0.0
 motion_update_period_s: 0.25
 axis_excitation_target_rad: 1.2
 min_samples: 500

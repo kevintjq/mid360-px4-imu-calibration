@@ -7,7 +7,7 @@ ROS1 / Ubuntu 20.04 C++ online extrinsic calibration for a Livox Mid360 and a PX
 The workflow follows the staged idea of [HKU-MaRS LiDAR_IMU_Init](https://github.com/hku-mars/LiDAR_IMU_Init):
 
 1. keep the rigid assembly still for initialization;
-2. automatically accumulate motion until roll, pitch, and yaw excitation are sufficient;
+2. collect roll, pitch, and yaw excitation sequentially; each progress bar must reach 100% before the next axis starts;
 3. estimate LiDAR scan motion with ICP;
 4. search the IMU time offset, solve rotation, then solve the lever arm from acceleration;
 5. validate residuals and print LI-Init-style progress bars and final results.
@@ -47,7 +47,7 @@ Edit `config/online_calibration.yaml`, then run:
 roslaunch mid360_px4_calibration online_calibration.launch
 ```
 
-The terminal displays three excitation bars. Keep the sensor assembly rigid and follow the instruction for the least-complete axis: slow roll (X), pitch (Y), and yaw (Z), with direction changes. A static, geometrically rich scene is required for ICP; avoid blank walls and moving objects.
+The terminal displays three excitation bars. After the static stage, it asks for roll (X), then pitch (Y), then yaw (Z). The next step is not entered until the current bar reaches 100%. With the default `motion_timeout_s: 0.0`, the node waits indefinitely if the device is not moved; it never proceeds with insufficient motion data. Use Ctrl+C to abort. A static, geometrically rich scene is required for ICP; avoid blank walls and moving objects.
 
 Results are written under the package directory by default:
 

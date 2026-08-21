@@ -82,7 +82,10 @@ class Calibrator {
     pnh_.param("mid_gyro_scale", mid_gyro_scale_, 1.0);
     pnh_.param("body_gyro_scale", body_gyro_scale_, 1.0);
     pnh_.param("static_duration_s", static_s_, 5.0);
-    pnh_.param("motion_max_duration_s", motion_max_s_, 22.0);
+    // Zero means wait indefinitely, like LI-Init's data sufficiency stage.
+    // A positive value is an optional safety timeout and aborts calibration;
+    // it never proceeds with insufficient motion data.
+    pnh_.param("motion_timeout_s", motion_timeout_s_, 0.0);
     pnh_.param("motion_update_period_s", update_s_, 0.25);
     pnh_.param("axis_excitation_target_rad", target_rad_, 1.2);
     pnh_.param("min_samples", min_samples_, 500);
@@ -106,7 +109,7 @@ class Calibrator {
     ROS_INFO("Mid360 IMU: %s | PX4 IMU: %s | LiDAR: %s", mid_topic_.c_str(), body_topic_.c_str(), lidar_topic_.c_str());
     collectStatic();
     if (!ros::ok()) return 2;
-    collectMotion();
+    if (!collectMotion()) return 2;
     collectStaticValidation();
     if (!checkData()) return 2;
     Result result;
@@ -174,34 +177,86 @@ class Calibrator {
     while (ros::ok() && ros::WallTime::now() < end) { ros::spinOnce(); rate.sleep(); }
   }
 
-  std::array<double,3> excitation() {
-    std::lock_guard<std::mutex> lock(mutex_); std::array<double,3> out{0,0,0}; if (mid_.size() < 5) return out;
-    const double static_end = mid_.front().t + static_s_; size_t start = 0; while (start + 1 < mid_.size() && mid_[start].t < static_end) ++start; start = std::min(start, mid_.size() / 2); Vec3 bias = Vec3::Zero(); for (size_t i = 0; i < start; ++i) bias += mid_[i].gyro; if (start) bias /= double(start);
-    for (size_t i = start + 1; i < mid_.size(); ++i) { const double dt = std::max(0.0, mid_[i].t - mid_[i-1].t); const Vec3 w = (mid_[i].gyro - bias).cwiseAbs(); for (int k=0;k<3;++k) out[k] += std::max(0.0, w[k] - 0.015) * dt / target_rad_; }
-    return out;
+  Vec3 staticGyroBias() {
+    std::lock_guard<std::mutex> lock(mutex_); Vec3 bias = Vec3::Zero(); size_t n = 0;
+    if (mid_.empty()) return bias;
+    const double end = mid_.front().t + static_s_;
+    for (const auto &s : mid_) { if (s.t > end) break; bias += s.gyro; ++n; }
+    return n ? bias / double(n) : bias;
+  }
+
+  double axisExcitation(int axis, double phase_start, const Vec3 &bias) {
+    std::lock_guard<std::mutex> lock(mutex_); if (mid_.size() < 2) return 0.0;
+    double accumulated = 0.0;
+    for (size_t i = 1; i < mid_.size(); ++i) {
+      if (mid_[i].t <= phase_start) continue;
+      const double dt = mid_[i].t - mid_[i - 1].t;
+      if (dt <= 0.0 || dt > 0.1) continue;
+      const double rate = std::abs(mid_[i].gyro[axis] - bias[axis]);
+      accumulated += std::max(0.0, rate - 0.015) * dt;
+    }
+    return accumulated / std::max(target_rad_, 1.0e-6);
   }
 
   size_t currentScanCount() { std::lock_guard<std::mutex> lock(mutex_); return scans_.size(); }
 
-  void excitationProgress(const std::array<double,3> &e) {
+  void excitationProgress(const std::array<double,3> &e, int active_axis) {
     static bool rendered = false;
     if (rendered) std::cout << "\033[4A";
     progress("[Initialization] Rotation around X Axis", e[0], e[0] >= 1.0 ? GREEN : YELLOW, true);
     progress("[Initialization] Rotation around Y Axis", e[1], e[1] >= 1.0 ? GREEN : YELLOW, true);
     progress("[Initialization] Rotation around Z Axis", e[2], e[2] >= 1.0 ? GREEN : YELLOW, true);
     std::cout << CYAN << "[Initialization] IMU samples=" << currentMidCount()
-              << " | LiDAR scans=" << currentScanCount() << RESET << "\n";
+              << " | LiDAR scans=" << currentScanCount()
+              << " | active axis=" << (active_axis == 0 ? "ROLL/X" : active_axis == 1 ? "PITCH/Y" : "YAW/Z")
+              << RESET << "\n";
     std::cout.flush(); rendered = true;
   }
 
   void collectStatic() { ROS_INFO("[Initialization] Keep the rigid assembly still."); const ros::WallTime begin = ros::WallTime::now(); while (ros::ok()) { const double f = (ros::WallTime::now()-begin).toSec()/static_s_; progress("[Initialization] Static initialization", f, f>=1?GREEN:YELLOW, true); if (f>=1) break; spinFor(update_s_); } }
-  void collectMotion() {
-    ROS_INFO("[Initialization] Move only after the static phase; follow the least-complete axis."); const ros::WallTime begin = ros::WallTime::now(); bool enough = false;
-    while (ros::ok() && (ros::WallTime::now()-begin).toSec() < motion_max_s_) { const auto e = excitation(); const bool ready = e[0]>=1 && e[1]>=1 && e[2]>=1 && currentMidCount()>=static_cast<size_t>(min_samples_); excitationProgress(e); const char *axis = (e[0] < e[1] && e[0] < e[2]) ? "ROLL/X" : (e[1] < e[2] ? "PITCH/Y" : "YAW/Z"); ROS_INFO_THROTTLE(2.0, "[Initialization] Excitation X=%.0f%% Y=%.0f%% Z=%.0f%%; slowly excite %s", 100*clamp01(e[0]),100*clamp01(e[1]),100*clamp01(e[2]),axis); if (ready) { enough = true; break; } spinFor(update_s_); }
-    if (!enough) ROS_WARN("[Initialization] Motion timeout; proceeding with collected data."); else ROS_INFO("[Initialization] Data accumulation finished, calibration begins.");
+  bool collectMotion() {
+    const char *labels[3] = {"ROLL / X", "PITCH / Y", "YAW / Z"};
+    const char *instructions[3] = {
+      "rotate slowly forward/back around X (roll), about +/-30 degrees",
+      "rotate slowly forward/back around Y (pitch), about +/-30 degrees",
+      "rotate slowly forward/back around Z (yaw), about +/-30 degrees"};
+    const Vec3 bias = staticGyroBias();
+    std::array<double, 3> bars{0.0, 0.0, 0.0};
+    for (int axis = 0; axis < 3 && ros::ok(); ++axis) {
+      ROS_INFO("[Initialization] Step %d/3: %s", axis + 1, labels[axis]);
+      ROS_INFO("[Initialization] Please %s. This step waits until its bar reaches 100%%.", instructions[axis]);
+      const double phase_start = latestMidTime();
+      const ros::WallTime begin = ros::WallTime::now();
+      while (ros::ok()) {
+        bars[axis] = axisExcitation(axis, phase_start, bias);
+        // Earlier axes stay green and full; later axes remain empty until
+        // their own stage starts, matching LI-Init's staged terminal UI.
+        std::array<double, 3> display = bars;
+        for (int k = 0; k < axis; ++k) display[k] = 1.0;
+        for (int k = axis + 1; k < 3; ++k) display[k] = 0.0;
+        excitationProgress(display, axis);
+        if (currentMidCount() < 5) {
+          ROS_WARN_THROTTLE(3.0, "[Initialization] Waiting for IMU samples on %s; calibration will not advance without data.", mid_topic_.c_str());
+        }
+        if (bars[axis] >= 1.0) {
+          bars[axis] = 1.0;
+          ROS_INFO("[Initialization] %s excitation complete (100%%).", labels[axis]);
+          break;
+        }
+        if (motion_timeout_s_ > 0.0 && (ros::WallTime::now() - begin).toSec() >= motion_timeout_s_) {
+          ROS_ERROR("[Initialization] %s did not reach 100%% within the configured timeout. No calibration was run.", labels[axis]);
+          return false;
+        }
+        spinFor(update_s_);
+      }
+    }
+    if (!ros::ok()) return false;
+    ROS_INFO("[Initialization] Data accumulation finished, LiDAR-IMU calibration begins.");
+    return currentMidCount() >= static_cast<size_t>(min_samples_);
   }
   void collectStaticValidation() { const ros::WallTime begin = ros::WallTime::now(); while (ros::ok() && (ros::WallTime::now()-begin).toSec() < 1.5) { const double f=(ros::WallTime::now()-begin).toSec()/1.5; progress("[Initialization] Static validation",f,f>=1?GREEN:YELLOW,true); spinFor(update_s_); } }
   size_t currentMidCount() { std::lock_guard<std::mutex> lock(mutex_); return mid_.size(); }
+  double latestMidTime() { std::lock_guard<std::mutex> lock(mutex_); return mid_.empty() ? 0.0 : mid_.back().t; }
 
   bool checkData() { std::lock_guard<std::mutex> lock(mutex_); if (mid_.size()<static_cast<size_t>(min_samples_) || body_.size()<static_cast<size_t>(min_samples_)) { ROS_ERROR("Too few IMU samples: Mid360=%zu PX4=%zu (need %d)",mid_.size(),body_.size(),min_samples_); return false; } if (scans_.size()<static_cast<size_t>(min_scans_)) { ROS_ERROR("Too few valid LiDAR scans: %zu (need %d)",scans_.size(),min_scans_); return false; } return true; }
 
@@ -238,7 +293,7 @@ class Calibrator {
   void printResult(const Result&r){const Eigen::Vector3d e=r.R_B_M.transpose().eulerAngles(0,1,2)*180.0/M_PI; std::cout<<"\n"<<CYAN<<"[Init Result] "<<RESET<<"Translation Mid360 to PX4 body = "<<r.t_B_M.transpose()<<" m\n"<<CYAN<<"[Init Result] "<<RESET<<"RPY (ENU) = "<<e.transpose()<<" deg\n"<<GREEN<<"[Init Result] "<<RESET<<"accepted="<<(r.accepted?"true":"false")<<", gyro RMSE="<<r.gyro_rmse<<", accel RMSE="<<r.accel_rmse<<"\n"; }
 
   ros::NodeHandle nh_,pnh_; ros::Subscriber mid_sub_,body_sub_,cloud_sub_; std::mutex mutex_; std::vector<ImuSample> mid_,body_; std::vector<Scan> scans_;
-  std::string mid_topic_,body_topic_,lidar_topic_,output_yaml_,output_txt_; double mid_accel_scale_,body_accel_scale_,mid_gyro_scale_,body_gyro_scale_,static_s_,motion_max_s_,update_s_,target_rad_,voxel_,max_corr_,max_icp_error_,time_min_,time_max_,time_step_; int min_samples_,min_scans_,max_points_,icp_iterations_; bool ansi_;
+  std::string mid_topic_,body_topic_,lidar_topic_,output_yaml_,output_txt_; double mid_accel_scale_,body_accel_scale_,mid_gyro_scale_,body_gyro_scale_,static_s_,motion_timeout_s_,update_s_,target_rad_,voxel_,max_corr_,max_icp_error_,time_min_,time_max_,time_step_; int min_samples_,min_scans_,max_points_,icp_iterations_; bool ansi_;
 };
 }
 
