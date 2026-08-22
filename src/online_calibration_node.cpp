@@ -42,6 +42,9 @@ struct Result {
   double gyro_rmse = std::numeric_limits<double>::infinity();
   double accel_rmse = std::numeric_limits<double>::infinity();
   double translation_condition = std::numeric_limits<double>::infinity();
+  double odom_gyro_rms = 0.0;
+  double odom_alpha_rms = 0.0;
+  size_t odom_motion_samples = 0;
   bool accepted = false;
   std::string note;
 };
@@ -395,6 +398,13 @@ class Calibrator {
     r.translation_condition = std::numeric_limits<double>::infinity();
     if (svd.singularValues().size() >= 3 && svd.singularValues()(2) > 1e-6) r.translation_condition = svd.singularValues()(0) / svd.singularValues()(2);
     const Eigen::VectorXd x = A.colPivHouseholderQr().solve(y);
+    r.odom_motion_samples = ts.size();
+    for (size_t i = 0; i < ts.size(); ++i) {
+      r.odom_gyro_rms += wm[i].squaredNorm();
+      r.odom_alpha_rms += alpha[i].squaredNorm();
+    }
+    r.odom_gyro_rms = std::sqrt(r.odom_gyro_rms / ts.size());
+    r.odom_alpha_rms = std::sqrt(r.odom_alpha_rms / ts.size());
     r.t_M_B = x.head<3>(); r.t_B_M = -r.R_B_M * r.t_M_B;
     r.accel_rmse = (A * x - y).norm() / std::sqrt(static_cast<double>(rows));
     stage("Lever-arm solve", 1.0);
@@ -403,8 +413,12 @@ class Calibrator {
     r.reference_stamp = pose.back().t;
     r.t_M_B_enu = R_W_B_ref * r.t_B_M;
     r.accepted = std::isfinite(r.gyro_rmse) && std::isfinite(r.accel_rmse) &&
-                 r.accel_rmse < 1.5 && r.translation_condition < 1e5;
-    r.note = r.accepted ? "accepted" : "poor odom/IMU excitation or residual quality";
+                 r.accel_rmse < 1.5 && r.translation_condition < 1e5 &&
+                 r.odom_motion_samples >= 30 && r.odom_alpha_rms > 0.03;
+    r.note = r.accepted ? "accepted" : "translation system is poorly observable; repeat with larger roll/pitch/yaw motion";
+    if (!std::isfinite(r.translation_condition) || r.translation_condition >= 1e5)
+      ROS_ERROR("Lever-arm solve is rank-deficient: condition=%.3g, samples=%zu, gyro RMS=%.4f, angular-accel RMS=%.4f.",
+                r.translation_condition, r.odom_motion_samples, r.odom_gyro_rms, r.odom_alpha_rms);
     return true;
   }
 
@@ -424,6 +438,9 @@ class Calibrator {
        << "  rpy_mid360_to_body_XYZ_deg: " << list3(rpy) << "\n"
        << "quality:\n  accel_rmse_m_s2: " << r.accel_rmse
        << "\n  translation_condition_number: " << r.translation_condition
+       << "\n  odom_motion_samples: " << r.odom_motion_samples
+       << "\n  odom_gyro_rms_rad_s: " << r.odom_gyro_rms
+       << "\n  odom_angular_accel_rms_rad_s2: " << r.odom_alpha_rms
        << "\n  accepted: " << (r.accepted ? "true" : "false") << "\n  note: \"" << r.note << "\"\n";
     ft << std::fixed << std::setprecision(9)
        << "FAST-LIO body relative to PX4 IMU\n"
@@ -437,6 +454,9 @@ class Calibrator {
        << "rpy_mid360_to_body_XYZ_deg: " << rpy.transpose() << "\n"
        << "accel_rmse_m_s2: " << r.accel_rmse << "\n"
        << "translation_condition_number: " << r.translation_condition << "\n"
+       << "odom_motion_samples: " << r.odom_motion_samples << "\n"
+       << "odom_gyro_rms_rad_s: " << r.odom_gyro_rms << "\n"
+       << "odom_angular_accel_rms_rad_s2: " << r.odom_alpha_rms << "\n"
        << "accepted: " << (r.accepted ? "true" : "false") << "\n"
        << "note: " << r.note << "\n";
   }
@@ -448,7 +468,9 @@ class Calibrator {
               << "Fixed body-frame FLU offset = " << r.t_B_M.transpose() << " m\n"
               << GREEN << "[Final Result] " << RESET
               << "accepted=" << (r.accepted ? "true" : "false")
-              << ", accel RMSE=" << r.accel_rmse << "\n";
+              << ", accel RMSE=" << r.accel_rmse
+              << ", condition=" << r.translation_condition
+              << ", angular-accel RMS=" << r.odom_alpha_rms << "\n";
   }
 
   ros::NodeHandle nh_, pnh_;
