@@ -21,6 +21,7 @@ output_txt: "config/online_calibration_result.txt"
 # 100% before Z starts. The default timeout is zero: wait indefinitely instead
 # of running a calibration with insufficient motion.
 static_duration_s: 8.0
+settle_duration_s: 5.0
 static_validation_duration_s: 3.0
 motion_timeout_s: 0.0
 motion_update_period_s: 0.25

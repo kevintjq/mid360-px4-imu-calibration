@@ -93,6 +93,7 @@ class Calibrator {
     pnh_.param("body_gyro_scale", body_gyro_scale_, 1.0);
     pnh_.param("static_duration_s", static_s_, 8.0);
     pnh_.param("static_validation_duration_s", static_validation_s_, 3.0);
+    pnh_.param("settle_duration_s", settle_s_, 5.0);
     pnh_.param("motion_timeout_s", motion_timeout_s_, 0.0);
     pnh_.param("motion_update_period_s", update_s_, 0.25);
     pnh_.param("axis_excitation_target_rad", target_rad_, 2.5);
@@ -236,8 +237,14 @@ class Calibrator {
 
   void collectStaticValidation() {
     ROS_INFO("[Validation] Three-axis excitation is complete.");
-    ROS_INFO("[Validation] Stop moving now and keep the rigid assembly completely still for %.1f seconds.",
-             static_validation_s_);
+    ROS_INFO("[Validation] Place the assembly down and allow it to settle for %.1f seconds.", settle_s_);
+    const ros::WallTime settle_begin = ros::WallTime::now();
+    while (ros::ok() && (ros::WallTime::now() - settle_begin).toSec() < settle_s_) {
+      const double f = (ros::WallTime::now() - settle_begin).toSec() / std::max(settle_s_, 1e-3);
+      bar("[Validation] Settling", f, f >= 1.0 ? GREEN : YELLOW);
+      spinFor(update_s_);
+    }
+    ROS_INFO("[Validation] Keep the rigid assembly completely still for %.1f seconds.", static_validation_s_);
     const ros::WallTime begin = ros::WallTime::now();
     while (ros::ok() && (ros::WallTime::now() - begin).toSec() < static_validation_s_) {
       const double f = (ros::WallTime::now() - begin).toSec() / static_validation_s_;
@@ -480,7 +487,7 @@ class Calibrator {
   std::vector<PoseSample> pose_, odom_;
   std::string odom_topic_, body_imu_topic_, body_pose_topic_, output_yaml_, output_txt_;
   std::string body_frame_, pose_frame_, odom_frame_, odom_child_frame_;
-  double body_accel_scale_, body_gyro_scale_, static_s_, static_validation_s_, motion_timeout_s_, update_s_, target_rad_;
+  double body_accel_scale_, body_gyro_scale_, static_s_, static_validation_s_, settle_s_, motion_timeout_s_, update_s_, target_rad_;
   int min_samples_, min_odom_samples_;
 };
 }
