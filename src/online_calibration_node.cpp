@@ -213,6 +213,18 @@ class Calibrator {
     return total / std::max(target_rad_, 1e-6);
   }
 
+  double odomExcitation(double start) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    double total = 0.0;
+    for (size_t i = 1; i < odom_.size(); ++i) {
+      if (odom_[i].t <= start) continue;
+      const double dt = odom_[i].t - odom_[i - 1].t;
+      if (dt <= 0.0 || dt > 0.5) continue;
+      total += rotVec(odom_[i - 1].R_W_S.transpose() * odom_[i].R_W_S).norm();
+    }
+    return total / std::max(target_rad_, 1e-6);
+  }
+
   bool collectMotion() {
     const char *labels[3] = {"ROLL / X", "PITCH / Y", "YAW / Z"};
     const char *help[3] = {"rotate slowly forward/back around X", "rotate slowly forward/back around Y", "rotate slowly forward/back around Z"};
@@ -223,7 +235,9 @@ class Calibrator {
       const double start = latestImuTime();
       const ros::WallTime begin = ros::WallTime::now();
       while (ros::ok()) {
-        const double f = excitation(axis, start, bias);
+        const double px4_f = excitation(axis, start, bias);
+        const double odom_f = odomExcitation(start);
+        const double f = std::min(px4_f, odom_f);
         bar("[Initialization] Rotation around X Axis", axis == 0 ? f : axis > 0 ? 1.0 : 0.0, axis == 0 && f < 1.0 ? YELLOW : GREEN);
         bar("[Initialization] Rotation around Y Axis", axis == 1 ? f : axis > 1 ? 1.0 : 0.0, axis == 1 && f < 1.0 ? YELLOW : GREEN);
         bar("[Initialization] Rotation around Z Axis", axis == 2 ? f : 0.0, axis == 2 && f < 1.0 ? YELLOW : GREEN);
