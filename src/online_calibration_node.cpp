@@ -22,7 +22,17 @@ using Vec3 = Eigen::Vector3d;
 using Mat3 = Eigen::Matrix3d;
 
 struct ImuSample { double t; Vec3 w; Vec3 a; };
-struct PoseSample { double t; Vec3 p; Mat3 R_W_S; };
+struct PoseSample {
+  double t;
+  Vec3 p;
+  Mat3 R_W_S;
+  Vec3 v_S;
+  Vec3 w_S;
+  bool has_twist;
+  PoseSample(double stamp, const Vec3 &position, const Mat3 &rotation)
+      : t(stamp), p(position), R_W_S(rotation), v_S(Vec3::Zero()),
+        w_S(Vec3::Zero()), has_twist(false) {}
+};
 struct Result {
   Mat3 R_B_M = Mat3::Identity();
   Vec3 t_B_M = Vec3::Zero();
@@ -97,7 +107,16 @@ class Calibrator {
     collectStatic();
     if (!collectMotion() || !ros::ok()) return 2;
     collectStaticValidation();
+    const double final_gyro_norm = validationGyroNorm();
+    if (!std::isfinite(final_gyro_norm) || final_gyro_norm > 0.08) {
+      ROS_ERROR("Final static validation failed: mean gyro norm=%.4f rad/s. Keep still and rerun.", final_gyro_norm);
+      return 2;
+    }
     if (!checkData()) return 2;
+    ROS_INFO("Received FAST-LIO frames: world='%s', child='%s'; PX4 IMU frame='%s', pose frame='%s'.",
+             odom_frame_.c_str(), odom_child_frame_.c_str(), body_frame_.c_str(), pose_frame_.c_str());
+    ROS_WARN("FAST-LIO world frame '%s' is a local initialization frame, not automatically ENU.",
+             odom_frame_.c_str());
     Result result;
     if (!solve(result)) return 3;
     writeResults(result);
@@ -134,9 +153,17 @@ class Calibrator {
     const auto &q = msg->pose.pose.orientation;
     Eigen::Quaterniond quat(q.w, q.x, q.y, q.z);
     if (!std::isfinite(t) || !quat.coeffs().allFinite() || quat.norm() < 1e-6) return;
+    PoseSample sample{t, Vec3(p.x, p.y, p.z), quat.normalized().toRotationMatrix()};
+    const auto &v = msg->twist.twist.linear;
+    const auto &w = msg->twist.twist.angular;
+    sample.v_S = Vec3(v.x, v.y, v.z);
+    sample.w_S = Vec3(w.x, w.y, w.z);
+    sample.has_twist = sample.v_S.allFinite() && sample.w_S.allFinite() &&
+                       sample.v_S.norm() < 100.0 && sample.w_S.norm() < 30.0;
     std::lock_guard<std::mutex> lock(mutex_);
-    odom_.push_back(PoseSample{t, Vec3(p.x, p.y, p.z), quat.normalized().toRotationMatrix()});
+    odom_.push_back(sample);
     if (odom_frame_.empty()) odom_frame_ = msg->header.frame_id;
+    if (odom_child_frame_.empty()) odom_child_frame_ = msg->child_frame_id;
   }
 
   void spinFor(double seconds) {
@@ -205,12 +232,30 @@ class Calibrator {
   }
 
   void collectStaticValidation() {
+    ROS_INFO("[Validation] Three-axis excitation is complete.");
+    ROS_INFO("[Validation] Stop moving now and keep the rigid assembly completely still for %.1f seconds.",
+             static_validation_s_);
     const ros::WallTime begin = ros::WallTime::now();
     while (ros::ok() && (ros::WallTime::now() - begin).toSec() < static_validation_s_) {
       const double f = (ros::WallTime::now() - begin).toSec() / static_validation_s_;
       bar("[Initialization] Static validation", f, f >= 1.0 ? GREEN : YELLOW);
       spinFor(update_s_);
     }
+  }
+
+  double validationGyroNorm() {
+    const Vec3 bias = staticBias();
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (imu_.empty()) return std::numeric_limits<double>::infinity();
+    const double start = imu_.back().t - static_validation_s_;
+    Vec3 mean = Vec3::Zero();
+    size_t n = 0;
+    for (auto it = imu_.rbegin(); it != imu_.rend(); ++it) {
+      if (it->t < start) break;
+      mean += it->w;
+      ++n;
+    }
+    return n ? (mean / static_cast<double>(n) - bias).norm() : std::numeric_limits<double>::infinity();
   }
 
   bool checkData() {
@@ -284,17 +329,34 @@ class Calibrator {
     if (accel_bias_samples) accel_bias /= static_cast<double>(accel_bias_samples);
 
     stage("SLAM odom motion", 0.1);
-    std::vector<double> ts; std::vector<Mat3> Rwm; std::vector<Vec3> aw, wm, alpha;
+    std::vector<double> ts; std::vector<Vec3> aw, wm, alpha;
     for (size_t i = 1; i + 1 < odom.size(); ++i) {
-      const double dt0 = odom[i].t - odom[i - 1].t, dt1 = odom[i + 1].t - odom[i].t;
+      const size_t li = i >= 2 ? i - 2 : i - 1;
+      const size_t ri = i + 2 < odom.size() ? i + 2 : i + 1;
+      const double dt0 = odom[i].t - odom[li].t, dt1 = odom[ri].t - odom[i].t;
       if (dt0 <= 1e-4 || dt1 <= 1e-4 || dt0 > 1.0 || dt1 > 1.0) continue;
-      const Vec3 v0 = (odom[i].p - odom[i - 1].p) / dt0;
-      const Vec3 v1 = (odom[i + 1].p - odom[i].p) / dt1;
-      const Vec3 w = rotVec(odom[i - 1].R_W_S.transpose() * odom[i + 1].R_W_S) * (2.0 / (dt0 + dt1));
-      const Vec3 w0 = rotVec(odom[i - 1].R_W_S.transpose() * odom[i].R_W_S) / dt0;
-      const Vec3 w1 = rotVec(odom[i].R_W_S.transpose() * odom[i + 1].R_W_S) / dt1;
-      ts.push_back(odom[i].t); Rwm.push_back(odom[i].R_W_S); aw.push_back(2.0 * (v1 - v0) / (dt0 + dt1)); wm.push_back(w);
-      alpha.push_back(2.0 * (w1 - w0) / (dt0 + dt1));
+      Vec3 a_m, w_m, alpha_m;
+      if (odom[li].has_twist && odom[i].has_twist && odom[ri].has_twist) {
+        // FAST-LIO normally reports twist in its child (Mid360) frame. Convert
+        // linear velocity to world before differentiating it.
+        const Vec3 vw0 = odom[li].R_W_S * odom[li].v_S;
+        const Vec3 vw1 = odom[ri].R_W_S * odom[ri].v_S;
+        a_m = odom[i].R_W_S.transpose() * (vw1 - vw0) / (dt0 + dt1) * 2.0;
+        w_m = 0.5 * (odom[li].w_S + odom[ri].w_S);
+        alpha_m = 2.0 * (odom[ri].w_S - odom[li].w_S) / (dt0 + dt1);
+      } else {
+        const Vec3 v0 = (odom[i].p - odom[li].p) / dt0;
+        const Vec3 v1 = (odom[ri].p - odom[i].p) / dt1;
+        const Vec3 w0 = rotVec(odom[li].R_W_S.transpose() * odom[i].R_W_S) / dt0;
+        const Vec3 w1 = rotVec(odom[i].R_W_S.transpose() * odom[ri].R_W_S) / dt1;
+        a_m = odom[i].R_W_S.transpose() * (v1 - v0) * 2.0 / (dt0 + dt1);
+        w_m = (dt1 * w0 + dt0 * w1) / (dt0 + dt1);
+        alpha_m = 2.0 * (w1 - w0) / (dt0 + dt1);
+      }
+      if (!a_m.allFinite() || !w_m.allFinite() || !alpha_m.allFinite() ||
+          a_m.norm() > 100.0 || w_m.norm() > 30.0 || alpha_m.norm() > 100.0) continue;
+      ts.push_back(odom[i].t); aw.push_back(a_m); wm.push_back(w_m);
+      alpha.push_back(alpha_m);
     }
     if (ts.size() < 10) return false;
     stage("SLAM odom motion", 1.0);
@@ -322,7 +384,8 @@ class Calibrator {
       const Vec3 ab = interp(imu, ts[i], false) - accel_bias + R_EB.transpose() * gravity_enu;
       A.block<3, 3>(3 * rows, 0) = r.R_B_M * (skew(alpha[i]) + skew(wm[i]) * skew(wm[i]));
       A.block<3, 3>(3 * rows, 3) = Mat3::Identity();
-      y.segment<3>(3 * rows) = ab - r.R_B_M * (Rwm[i].transpose() * aw[i]);
+      // aw is already expressed in the Mid360 frame (M).
+      y.segment<3>(3 * rows) = ab - r.R_B_M * aw[i];
       ++rows;
     }
     if (rows < 10) return false;
@@ -350,7 +413,11 @@ class Calibrator {
     const std::string y = packagePath(output_yaml_), t = packagePath(output_txt_);
     const Vec3 rpy = rpyDeg(r.R_B_M);
     std::ofstream fy(y), ft(t);
-    fy << "slam_odom_to_px4_imu:\n"
+    fy << "fastlio_body_to_px4_imu:\n"
+       << "  odom_world_frame: \"" << odom_frame_ << "\"\n"
+       << "  odom_child_frame: \"" << odom_child_frame_ << "\"\n"
+       << "  px4_imu_frame: \"" << body_frame_ << "\"\n"
+       << "  translation_fastlio_body_relative_to_px4_imu_FLU_m: " << list3(r.t_B_M) << "\n"
        << "  translation_body_FLU_m: " << list3(r.t_B_M) << "\n"
        << "  translation_mid360_relative_to_px4_imu_ENU_m: " << list3(r.t_M_B_enu) << "\n"
        << "  enu_reference_stamp: " << r.reference_stamp << "\n"
@@ -359,7 +426,11 @@ class Calibrator {
        << "\n  translation_condition_number: " << r.translation_condition
        << "\n  accepted: " << (r.accepted ? "true" : "false") << "\n  note: \"" << r.note << "\"\n";
     ft << std::fixed << std::setprecision(9)
-       << "SLAM odometry Mid360 relative to PX4 IMU\n"
+       << "FAST-LIO body relative to PX4 IMU\n"
+       << "odom_world_frame: " << odom_frame_ << "\n"
+       << "odom_child_frame: " << odom_child_frame_ << "\n"
+       << "px4_imu_frame: " << body_frame_ << "\n"
+       << "translation_fastlio_body_relative_to_px4_imu_FLU_m: " << r.t_B_M.transpose() << "\n"
        << "translation_body_FLU_m: " << r.t_B_M.transpose() << "\n"
        << "translation_mid360_relative_to_px4_imu_ENU_m: " << r.t_M_B_enu.transpose() << "\n"
        << "enu_reference_stamp: " << r.reference_stamp << "\n"
@@ -371,7 +442,7 @@ class Calibrator {
   }
   void printResult(const Result &r) {
     std::cout << "\n" << CYAN << "[Final Result] " << RESET
-              << "Mid360 relative to PX4 IMU in ENU (reference attitude) = "
+              << "FAST-LIO body relative to PX4 IMU in ENU (reference attitude) = "
               << r.t_M_B_enu.transpose() << " m\n"
               << CYAN << "[Final Result] " << RESET
               << "Fixed body-frame FLU offset = " << r.t_B_M.transpose() << " m\n"
@@ -386,7 +457,7 @@ class Calibrator {
   std::vector<ImuSample> imu_;
   std::vector<PoseSample> pose_, odom_;
   std::string odom_topic_, body_imu_topic_, body_pose_topic_, output_yaml_, output_txt_;
-  std::string body_frame_, pose_frame_, odom_frame_;
+  std::string body_frame_, pose_frame_, odom_frame_, odom_child_frame_;
   double body_accel_scale_, body_gyro_scale_, static_s_, static_validation_s_, motion_timeout_s_, update_s_, target_rad_;
   int min_samples_, min_odom_samples_;
 };
