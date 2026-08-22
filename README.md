@@ -1,72 +1,38 @@
-# Mid360/PX4 IMU Calibration
+# Mid360/PX4 IMU Extrinsic Calibration
 
 English | [中文](README_CN.md)
 
-ROS1 / Ubuntu 20.04 C++ online extrinsic calibration for a Livox Mid360 and a PX4 body IMU. The node subscribes to two IMU topics and one LiDAR point-cloud topic, publishes nothing, and writes the Mid360 pose relative to the PX4 `base_link` body frame. MAVROS uses ROS ENU-side frame semantics; the body frame itself follows ROS FLU (forward-left-up) convention.
+ROS1 / Ubuntu 20.04 C++ online calibration for a Livox Mid360 (or another SLAM sensor) rigidly mounted to a PX4 IMU. The node subscribes only to a generic `nav_msgs/Odometry` topic, `/mavros/imu/data_raw`, and `/mavros/imu/data`. It publishes nothing and writes YAML/TXT results.
 
-The workflow follows the staged idea of [HKU-MaRS LiDAR_IMU_Init](https://github.com/hku-mars/LiDAR_IMU_Init):
+The workflow is inspired by [LiDAR_IMU_Init](https://github.com/hku-mars/LiDAR_IMU_Init): keep still, excite roll → pitch → yaw sequentially, estimate rotation from angular motion, estimate the lever arm from acceleration, and validate residuals. The odometry source is generic and is not tied to FAST-LIO.
 
-1. keep the rigid assembly still for initialization;
-2. collect roll, pitch, and yaw excitation sequentially; each progress bar must reach 100% before the next axis starts;
-3. estimate LiDAR scan motion with ICP;
-4. search the IMU time offset, solve rotation, then solve the lever arm from acceleration;
-5. validate residuals and print LI-Init-style progress bars and final results.
+The fixed result `t_B_M` is the SLAM/Mid360 sensor origin relative to the PX4 IMU origin, expressed in PX4 body FLU axes. The reported ENU vector is this offset rotated by the MAVROS attitude at `enu_reference_stamp`, so ENU components change with vehicle attitude.
 
-## Topics
-
-Defaults in `config/online_calibration.yaml`:
+## Configuration
 
 ```yaml
-mid_imu_topic: "/livox/imu"
+slam_odom_topic: "/Odometry"
 body_imu_topic: "/mavros/imu/data_raw"
-lidar_topic: "/livox/lidar"
+body_pose_topic: "/mavros/imu/data"
 ```
 
-Both IMU topics must be `sensor_msgs/Imu`. The LiDAR subscriber accepts `sensor_msgs/PointCloud2` and Livox `CustomMsg` (`livox_ros_driver` / `livox_ros_driver2`). Angular velocity must be in rad/s. Check the stationary acceleration norm with `rostopic echo`; Livox built-in IMU commonly needs `mid_accel_scale: 9.80665`, while PX4 raw IMU is normally already in m/s².
+The odometry message must contain valid metric pose data and overlapping timestamps. Adjust scale parameters only if the driver units require it.
 
-## Build
+## Build and run (ROS Noetic)
 
 ```bash
-sudo apt update
 sudo apt install ros-noetic-roscpp ros-noetic-roslib ros-noetic-sensor-msgs \
-  ros-noetic-topic-tools ros-noetic-pcl-ros ros-noetic-pcl-conversions \
-  libeigen3-dev
-mkdir -p ~/catkin_ws/src
-cd ~/catkin_ws/src
+  ros-noetic-nav-msgs libeigen3-dev
+mkdir -p ~/catkin_ws/src && cd ~/catkin_ws/src
 git clone https://github.com/kevintjq/mid360-px4-imu-calibration.git
-cd ..
-catkin_make
+cd .. && catkin_make
 source devel/setup.bash
-```
-
-## Run
-
-Edit `config/online_calibration.yaml`, then run:
-
-```bash
 roslaunch mid360_px4_calibration online_calibration.launch
 ```
 
-The terminal displays three excitation bars. After the static stage, it asks for roll (X), then pitch (Y), then yaw (Z). The next step is not entered until the current bar reaches 100%. The default collection is intentionally longer: 8 seconds static, 2.5 rad accumulated excitation per axis, at least 1500 IMU samples, and 30 valid LiDAR scans. With `motion_timeout_s: 0.0`, the node waits indefinitely if the device is not moved; it never proceeds with insufficient motion data. Use Ctrl+C to abort. A static, geometrically rich scene is required for ICP; avoid blank walls and moving objects.
+Keep the assembly still during initialization and validation, then follow the terminal's roll/pitch/yaw instructions. `motion_timeout_s: 0.0` waits indefinitely for sufficient motion.
 
-Results are written under the package directory by default:
-
-- `config/online_calibration_result.yaml`
-- `config/online_calibration_result.txt`
-
-The requested result is:
-
-```yaml
-mid360_relative_to_body_enu:
-  translation_B_M_m: [x, y, z]
-  rpy_B_M_deg: [roll, pitch, yaw]
-```
-
-`T_B_M` maps a vector from the Mid360 sensor frame `M` into the PX4 `base_link` body frame `B`. The numerical axes are the message frame axes; the surrounding ROS world convention is ENU and the body convention is FLU. MAVROS already performs the FCU NED/FRD to ROS-side conversion, so this node does not apply another NED/FRD conversion.
-
-## Data requirements and limitations
-
-The node needs synchronized, overlapping IMU data, at least `min_samples` samples per IMU, and at least `min_lidar_scans` valid scans. Calibration is rejected when ICP or residual quality is poor. This is a compact C++ initialization frontend inspired by LI-Init, not a replacement for the full FAST-LIO2 map/refinement pipeline; accurate mounting and strong 3-axis excitation remain important.
+Outputs: `config/online_calibration_result.yaml` and `config/online_calibration_result.txt`.
 
 ## License
 

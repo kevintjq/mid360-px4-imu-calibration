@@ -5,15 +5,13 @@ find_package(catkin REQUIRED COMPONENTS
   roscpp
   roslib
   sensor_msgs
-  topic_tools
-  pcl_ros
-  pcl_conversions
+  nav_msgs
 )
 
 find_package(Eigen3 REQUIRED)
 
 catkin_package(
-  CATKIN_DEPENDS roscpp roslib sensor_msgs topic_tools pcl_ros pcl_conversions
+  CATKIN_DEPENDS roscpp roslib sensor_msgs nav_msgs
   DEPENDS EIGEN3
 )
 
