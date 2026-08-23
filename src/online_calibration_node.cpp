@@ -474,11 +474,14 @@ class Calibrator {
        << "note: " << r.note << "\n";
   }
   void printResult(const Result &r) {
+    const Vec3 rpy = rpyDeg(r.R_B_M);
     std::cout << "\n" << CYAN << "[Final Result] " << RESET
               << "FAST-LIO body relative to PX4 IMU in ENU (reference attitude) = "
               << r.t_M_B_enu.transpose() << " m\n"
               << CYAN << "[Final Result] " << RESET
               << "Fixed body-frame FLU offset = " << r.t_B_M.transpose() << " m\n"
+              << CYAN << "[Final Result] " << RESET
+              << "RPY FAST-LIO body to PX4 body (XYZ, deg) = " << rpy.transpose() << "\n"
               << GREEN << "[Final Result] " << RESET
               << "accepted=" << (r.accepted ? "true" : "false")
               << ", accel RMSE=" << r.accel_rmse
