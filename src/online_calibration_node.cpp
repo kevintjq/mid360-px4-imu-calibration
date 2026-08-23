@@ -162,8 +162,9 @@ class Calibrator {
     const auto &w = msg->twist.twist.angular;
     sample.v_S = Vec3(v.x, v.y, v.z);
     sample.w_S = Vec3(w.x, w.y, w.z);
-    sample.has_twist = sample.v_S.allFinite() && sample.w_S.allFinite() &&
-                       sample.v_S.norm() < 100.0 && sample.w_S.norm() < 30.0;
+    // FAST-LIO builds often leave nav_msgs/Odometry.twist zero. The
+    // calibration deliberately uses pose quaternion differences instead.
+    sample.has_twist = false;
     std::lock_guard<std::mutex> lock(mutex_);
     odom_.push_back(sample);
     if (odom_frame_.empty()) odom_frame_ = msg->header.frame_id;
@@ -213,14 +214,14 @@ class Calibrator {
     return total / std::max(target_rad_, 1e-6);
   }
 
-  double odomExcitation(double start) {
+  double odomExcitation(int axis, double start) {
     std::lock_guard<std::mutex> lock(mutex_);
     double total = 0.0;
     for (size_t i = 1; i < odom_.size(); ++i) {
       if (odom_[i].t <= start) continue;
       const double dt = odom_[i].t - odom_[i - 1].t;
       if (dt <= 0.0 || dt > 0.5) continue;
-      total += rotVec(odom_[i - 1].R_W_S.transpose() * odom_[i].R_W_S).norm();
+      total += std::abs(rotVec(odom_[i - 1].R_W_S.transpose() * odom_[i].R_W_S)[axis]);
     }
     return total / std::max(target_rad_, 1e-6);
   }
@@ -236,7 +237,7 @@ class Calibrator {
       const ros::WallTime begin = ros::WallTime::now();
       while (ros::ok()) {
         const double px4_f = excitation(axis, start, bias);
-        const double odom_f = odomExcitation(start);
+        const double odom_f = odomExcitation(axis, start);
         const double f = std::min(px4_f, odom_f);
         bar("[Initialization] Rotation around X Axis", axis == 0 ? f : axis > 0 ? 1.0 : 0.0, axis == 0 && f < 1.0 ? YELLOW : GREEN);
         bar("[Initialization] Rotation around Y Axis", axis == 1 ? f : axis > 1 ? 1.0 : 0.0, axis == 1 && f < 1.0 ? YELLOW : GREEN);
@@ -360,23 +361,14 @@ class Calibrator {
       const double dt0 = odom[i].t - odom[li].t, dt1 = odom[ri].t - odom[i].t;
       if (dt0 <= 1e-4 || dt1 <= 1e-4 || dt0 > 1.0 || dt1 > 1.0) continue;
       Vec3 a_m, w_m, alpha_m;
-      if (odom[li].has_twist && odom[i].has_twist && odom[ri].has_twist) {
-        // FAST-LIO normally reports twist in its child (Mid360) frame. Convert
-        // linear velocity to world before differentiating it.
-        const Vec3 vw0 = odom[li].R_W_S * odom[li].v_S;
-        const Vec3 vw1 = odom[ri].R_W_S * odom[ri].v_S;
-        a_m = odom[i].R_W_S.transpose() * (vw1 - vw0) / (dt0 + dt1) * 2.0;
-        w_m = 0.5 * (odom[li].w_S + odom[ri].w_S);
-        alpha_m = 2.0 * (odom[ri].w_S - odom[li].w_S) / (dt0 + dt1);
-      } else {
-        const Vec3 v0 = (odom[i].p - odom[li].p) / dt0;
-        const Vec3 v1 = (odom[ri].p - odom[i].p) / dt1;
-        const Vec3 w0 = rotVec(odom[li].R_W_S.transpose() * odom[i].R_W_S) / dt0;
-        const Vec3 w1 = rotVec(odom[i].R_W_S.transpose() * odom[ri].R_W_S) / dt1;
-        a_m = odom[i].R_W_S.transpose() * (v1 - v0) * 2.0 / (dt0 + dt1);
-        w_m = (dt1 * w0 + dt0 * w1) / (dt0 + dt1);
-        alpha_m = 2.0 * (w1 - w0) / (dt0 + dt1);
-      }
+      const Vec3 v0 = (odom[i].p - odom[li].p) / dt0;
+      const Vec3 v1 = (odom[ri].p - odom[i].p) / dt1;
+      // Directly differentiate FAST-LIO pose quaternions in the body frame.
+      const Vec3 w0 = rotVec(odom[li].R_W_S.transpose() * odom[i].R_W_S) / dt0;
+      const Vec3 w1 = rotVec(odom[i].R_W_S.transpose() * odom[ri].R_W_S) / dt1;
+      a_m = odom[i].R_W_S.transpose() * (v1 - v0) * 2.0 / (dt0 + dt1);
+      w_m = (dt1 * w0 + dt0 * w1) / (dt0 + dt1);
+      alpha_m = 2.0 * (w1 - w0) / (dt0 + dt1);
       if (!a_m.allFinite() || !w_m.allFinite() || !alpha_m.allFinite() ||
           a_m.norm() > 100.0 || w_m.norm() > 30.0 || alpha_m.norm() > 100.0) continue;
       ts.push_back(odom[i].t); aw.push_back(a_m); wm.push_back(w_m);
