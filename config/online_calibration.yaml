@@ -1,6 +1,6 @@
 # C++ LI-Init-style online calibration parameters.
 slam_odom_topic: "/Odometry"
-body_imu_topic: "/mavros/imu/data_raw"
+body_imu_topic: "/mavros/imu/data"
 
 # ROS-side convention: MAVROS publishes the IMU in the ROS body frame
 # (normally base_link / FLU); ROS local/world coordinates are ENU. No extra
