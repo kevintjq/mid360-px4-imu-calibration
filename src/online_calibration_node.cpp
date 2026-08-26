@@ -85,8 +85,7 @@ class Calibrator {
  public:
   Calibrator(ros::NodeHandle &nh, ros::NodeHandle &pnh) : nh_(nh), pnh_(pnh) {
     pnh_.param("slam_odom_topic", odom_topic_, std::string("/Odometry"));
-    pnh_.param("body_imu_topic", body_imu_topic_, std::string("/mavros/imu/data_raw"));
-    pnh_.param("body_pose_topic", body_pose_topic_, std::string("/mavros/imu/data"));
+    pnh_.param("body_imu_topic", body_imu_topic_, std::string("/mavros/imu/data"));
     pnh_.param("output_yaml", output_yaml_, std::string("config/online_calibration_result.yaml"));
     pnh_.param("output_txt", output_txt_, std::string("config/online_calibration_result.txt"));
     pnh_.param("body_accel_scale", body_accel_scale_, 1.0);
@@ -100,14 +99,13 @@ class Calibrator {
     pnh_.param("min_samples", min_samples_, 1500);
     pnh_.param("min_odom_samples", min_odom_samples_, 30);
     sub_imu_ = nh_.subscribe(body_imu_topic_, 10000, &Calibrator::imuCallback, this);
-    sub_pose_ = nh_.subscribe(body_pose_topic_, 1000, &Calibrator::poseCallback, this);
     sub_odom_ = nh_.subscribe(odom_topic_, 2000, &Calibrator::odomCallback, this);
   }
 
   int run() {
     ROS_INFO("SLAM odom to PX4 IMU extrinsic calibration started.");
-    ROS_INFO("SLAM odom: %s | PX4 raw IMU: %s | PX4 ENU attitude: %s",
-             odom_topic_.c_str(), body_imu_topic_.c_str(), body_pose_topic_.c_str());
+    ROS_INFO("SLAM odom: %s | PX4 IMU/ENU attitude: %s",
+             odom_topic_.c_str(), body_imu_topic_.c_str());
     collectStatic();
     if (!collectMotion() || !ros::ok()) return 2;
     collectStaticValidation();
@@ -139,14 +137,9 @@ class Calibrator {
     std::lock_guard<std::mutex> lock(mutex_);
     if (body_frame_.empty()) body_frame_ = msg->header.frame_id;
     imu_.push_back(s);
-  }
-
-  void poseCallback(const sensor_msgs::ImuConstPtr &msg) {
-    const double t = msg->header.stamp.toSec();
     const auto &q = msg->orientation;
     Eigen::Quaterniond quat(q.w, q.x, q.y, q.z);
     if (!std::isfinite(t) || !quat.coeffs().allFinite() || quat.norm() < 1e-6) return;
-    std::lock_guard<std::mutex> lock(mutex_);
     pose_.push_back(PoseSample{t, Vec3::Zero(), quat.normalized().toRotationMatrix()});
     if (pose_frame_.empty()) pose_frame_ = msg->header.frame_id;
   }
@@ -490,11 +483,11 @@ class Calibrator {
   }
 
   ros::NodeHandle nh_, pnh_;
-  ros::Subscriber sub_imu_, sub_pose_, sub_odom_;
+  ros::Subscriber sub_imu_, sub_odom_;
   std::mutex mutex_;
   std::vector<ImuSample> imu_;
   std::vector<PoseSample> pose_, odom_;
-  std::string odom_topic_, body_imu_topic_, body_pose_topic_, output_yaml_, output_txt_;
+  std::string odom_topic_, body_imu_topic_, output_yaml_, output_txt_;
   std::string body_frame_, pose_frame_, odom_frame_, odom_child_frame_;
   double body_accel_scale_, body_gyro_scale_, static_s_, static_validation_s_, settle_s_, motion_timeout_s_, update_s_, target_rad_;
   int min_samples_, min_odom_samples_;

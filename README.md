@@ -2,7 +2,7 @@
 
 English | [中文](README_CN.md)
 
-ROS1 / Ubuntu 20.04 C++ calibration for the FAST-LIO body (Mid360 built-in IMU) relative to a PX4 IMU. The node reads `/Odometry`, `/mavros/imu/data_raw`, and `/mavros/imu/data`; it publishes no topics and writes YAML/TXT results.
+ROS1 / Ubuntu 20.04 C++ calibration for the FAST-LIO body (Mid360 built-in IMU) relative to a PX4 IMU. The node reads `/Odometry` and `/mavros/imu/data`; it publishes no topics and writes YAML/TXT results.
 
 ## Coordinate frames and target
 
@@ -37,8 +37,7 @@ This is an excitation-based batch estimate, not a guarantee of accuracy from a s
 
 ```yaml
 slam_odom_topic: "/Odometry"
-body_imu_topic: "/mavros/imu/data_raw"
-body_pose_topic: "/mavros/imu/data"
+body_imu_topic: "/mavros/imu/data"
 ```
 
 The odometry pose must be metric and time-overlapped with the IMU streams. Adjust scale parameters only when the driver units require it.

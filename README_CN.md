@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-这是一个 ROS1 / Ubuntu 20.04 C++ 标定工程，用于计算 FAST-LIO 机体系（Mid360 内置 IMU）相对 PX4 飞控 IMU 的固定外参。程序读取 `/Odometry`、`/mavros/imu/data_raw` 和 `/mavros/imu/data`，不发布任何话题，结果写入 YAML/TXT。
+这是一个 ROS1 / Ubuntu 20.04 C++ 标定工程，用于计算 FAST-LIO 机体系（Mid360 内置 IMU）相对 PX4 飞控 IMU 的固定外参。程序读取 `/Odometry` 和 `/mavros/imu/data`，不发布任何话题，结果写入 YAML/TXT。
 
 ## 坐标系和目标
 
@@ -36,8 +36,7 @@ T_B_M = [ R_B_M  t_B_M ]
 
 ```yaml
 slam_odom_topic: "/Odometry"
-body_imu_topic: "/mavros/imu/data_raw"
-body_pose_topic: "/mavros/imu/data"
+body_imu_topic: "/mavros/imu/data"
 ```
 
 odom 位姿必须是米制，并且与 IMU 话题有重叠时间。只有驱动单位不同时才修改 scale 参数。
