@@ -6,6 +6,7 @@
 #include <mid360_px4_calibration/static_window.h>
 #include <mid360_px4_calibration/terminal_ui.h>
 #include <mid360_px4_calibration/handling_gate.h>
+#include <mid360_px4_calibration/matched_solver.h>
 
 #include <cerrno>
 #include <clocale>
@@ -139,9 +140,8 @@ class Calibrator {
     if (imu_.size()<static_cast<size_t>(min_samples_) || odom_.size()<static_cast<size_t>(min_odom_)) {
       error_="总样本不足，请检查话题频率；IMU="+std::to_string(imu_.size())+"，odom="+std::to_string(odom_.size()); return fail();
     }
-    ui_.panel("08 / 08  求解与质量验收",0,{"采集完成，请稍候。","正在计算旋转、杆臂和质量指标……"});
-    const auto motion = mc::differentiate(odom_,limits_,windows_);
-    const mc::Result r = mc::solve(motion,imu_,gyro_bias_,accel_bias_,limits_);
+    ui_.panel("08 / 08  求解与质量验收",0,{"采集完成，请稍候。","正在进行同窗口积分配准，计算旋转、杆臂和质量指标……"});
+    const mc::Result r = mc::solveTrajectory(odom_,imu_,windows_,gyro_bias_,accel_bias_,limits_);
     report(r);
     if (!r.accepted) {
       ui_.message("未通过质量验收，未覆盖已有结果。请按上面的原因重新采集。",true); return 3;
@@ -410,7 +410,7 @@ class Calibrator {
       const auto q=Eigen::Quaterniond(r.R_B_M);
       const auto &ref=imu_.back();
       fy<<std::fixed<<std::setprecision(9)
-        <<"schema_version: 1\nfastlio_body_to_px4_imu:\n"
+        <<"schema_version: 1\nsolver_model: matched_integral_v1\nfastlio_body_to_px4_imu:\n"
         <<"  odom_world_frame: "<<std::quoted(world_frame_)<<"\n"
         <<"  odom_child_frame: "<<std::quoted(mid_frame_)<<"\n"
         <<"  px4_imu_frame: "<<std::quoted(body_frame_)<<"\n"

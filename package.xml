@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="2">
   <name>mid360_px4_calibration</name>
-  <version>0.5.0</version>
+  <version>0.6.0</version>
   <description>Guided ROS1 calibration of FAST-LIO body to PX4 with motion-quality validation.</description>
 
   <maintainer email="kevintjq@users.noreply.github.com">kevintjq</maintainer>

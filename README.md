@@ -69,7 +69,7 @@ The transform is `p_B = R_B_M * p_M + t_B_M`. `M` must be the Mid360 IMU body re
 
 FAST-LIO world (usually `camera_init`) need not be ENU. Position derivatives are transformed back into body coordinates. ENU translation is only the fixed FLU offset rotated at `enu_reference_stamp`, not a fixed world-frame extrinsic.
 
-Files include rotation matrix, quaternion `[x,y,z,w]`, fixed FLU translation, reference ENU translation, biases, timing convention, metrics/thresholds, and collection intervals. Matrix/quaternion output replaces legacy `rpy_mid360_to_body_XYZ_deg`; `translation_body_FLU_m` remains an alias.
+Files include rotation matrix, quaternion `[x,y,z,w]`, fixed FLU translation, reference ENU translation, biases, timing convention, metrics/thresholds, and collection intervals. `solver_model: matched_integral_v1` identifies the matched-window estimator. Matrix/quaternion output replaces legacy `rpy_mid360_to_body_XYZ_deg`; `translation_body_FLU_m` remains an alias.
 
 Absolute, `~/`, and package-relative output paths are supported; parents are created. Rejected calibrations preserve previous results. Files are checked before individual renames, which are not a cross-file atomic transaction; partial save failures report errors. Exit codes: `0` accepted and saved, `2` configuration/collection/save failure, `3` solve/quality rejection.
 
@@ -99,8 +99,14 @@ roslaunch mid360_px4_calibration online_calibration.launch config:=/absolute/pat
 | `min_angular_accel_rms_rad_s2` | 0.1 | Angular acceleration RMS floor |
 | `max_lever_arm_m` | 2 | Physical lever-arm length ceiling |
 
-Local cubic fits to position and rotation logarithms use a 0.3 s half-window, ignore usually-zero odometry twist, and do not cross stage boundaries or long gaps. IMU interpolation stays inside valid time ranges. SVD aligns angular velocity; translation and combined acceleration bias are jointly estimated, eliminating bias before testing lever-arm observability.
+The estimator uses **matched-window integral equations**, retaining the default 0.3 s half-window:
 
+1. Rotation aligns odometry endpoint-relative rotations against bias-corrected gyro rotation integrals over the same interval. Gyro RMSE, relative RMSE, and agreement compare rotation vectors divided by interval duration, i.e. matched interval-average motion.
+2. Translation applies the same discrete second-derivative stencil to position and rotation matrices, integrating gravity-corrected IMU acceleration with its corresponding Green kernel. Matching temporal responses removes the bias from comparing smoothed derivatives against instantaneous acceleration. Rotation-log derivatives are used only for motion selection and angular-acceleration diagnostics.
+3. Lever arm and constant body acceleration bias are jointly estimated. The rotating integrated bias basis is projected out before observability checks.
+4. Integration stays inside valid IMU ranges and cannot cross stage boundaries or long gaps. Kernel normalization is checked. The odometry world need not be ENU; usually-zero odometry twist is ignored.
+
+The solve performs per-window integration; wait for the terminal quality report after collection.
 Relative gyro RMSE is `RMSE / sqrt((IMU_RMS² + odom_RMS²) / 2)`. Agreement is normalized aligned-vector dot-product sum without mean subtraction, not a Pearson coefficient. All absolute/relative residual, agreement, excitation, and physical-size gates must pass.
 
 **No automatic time-offset estimation.** Synchronize clocks first, applying a nonzero offset only when known. Investigate timing, units, tracking, and rigid mounting before relaxing gates. Acceptance is not an absolute accuracy guarantee; repeat collection and compare the fixed FLU offset against physical measurements.
@@ -116,7 +122,16 @@ c++ -std=c++14 -O1 -Iinclude -I/usr/include/eigen3 \
 /tmp/calibration_math_test
 ```
 
-With testing enabled in the catkin build, enter `~/catkin_ws/build` and run `ctest --output-on-failure -R calibration_math_test`. Tests cover known extrinsics, bias degeneracy, static restarts, attitude changes, relative gyro errors, pickup confirmation, and noisy 10/20/50/200 Hz trajectories.
+With testing enabled in the catkin build, enter `~/catkin_ws/build` and run `ctest --output-on-failure -R calibration_math_test`. Tests cover known extrinsics, bias degeneracy, static restarts, attitude changes, relative gyro errors, pickup confirmation, noiseless and multiple noise seeds at 10/20/50/200 Hz, coupled rotations, irregular sampling, epoch timestamps, a non-ENU world, IMU gaps, and non-overlapping streams. The trajectory accuracy gates are now 0.1 mm without noise and 2 mm for fixed noisy cases, replacing the former 2 cm tolerance.
+
+The same 200 Hz odometry / 100 Hz IMU synthetic trajectory gives:
+
+| Data | Former lever error | Matched estimator error |
+| --- | ---: | ---: |
+| Noiseless | 12.44 mm | About 0.016 mm |
+| Fixed noise, seed 42 | 12.72 mm | About 0.29 mm |
+
+Independent Gaussian noise scales are 0.5 mm per position axis, 0.2 mrad attitude about X, 0.003 rad/s per gyro axis, and 0.02 m/s² per acceleration axis. These are particular synthetic results, not a hardware accuracy guarantee. Synchronization errors, correlated odometry drift, attitude errors, and installation rigidity still affect real measurements.
 
 | Symptom | First checks |
 | --- | --- |

@@ -142,74 +142,71 @@ inline std::vector<Motion> differentiate(const std::vector<Pose> &v, const Limit
   }
   return out;
 }
-inline Result solve(const std::vector<Motion> &motion, const std::vector<Imu> &imu,
-                    const Vec3 &gyro_bias, const Vec3 &initial_accel_bias, const Limits &lim) {
-  Result r;
-  std::vector<Motion> ms;
-  std::vector<Imu> bs;
-  Mat3 cross = Mat3::Zero(), excitation = Mat3::Zero();
-  for (const auto &m : motion) {
-    Imu b;
-    if (!interpolate(imu, m.t, lim.max_imu_gap, b)) continue;
-    b.w -= gyro_bias;
-    ms.push_back(m); bs.push_back(b);
-    cross += b.w*m.w.transpose();
-    excitation += m.w*m.w.transpose();
+struct LeverEquation { Mat3 C, D; Vec3 y; };
+
+// Inputs are paired angular velocities with gyro bias already removed.
+inline bool fitRotation(const std::vector<Motion> &motion,const std::vector<Imu> &body,
+                        const Limits &lim,Result &r) {
+  r.samples=motion.size();
+  if(motion.size()!=body.size() || motion.size()<lim.min_motion_samples) {
+    r.reasons.push_back("有效运动配对样本不足（检查话题频率、时间同步和里程计连续性）");return false;
   }
-  r.samples = ms.size();
-  if (ms.size() < lim.min_motion_samples) {
-    r.reasons.push_back("有效运动配对样本不足（检查话题频率、时间同步和里程计连续性）"); return r;
+  Mat3 cross=Mat3::Zero(),excitation=Mat3::Zero();
+  for(size_t i=0;i<motion.size();++i) {
+    cross+=body[i].w*motion[i].w.transpose();
+    excitation+=motion[i].w*motion[i].w.transpose();
   }
-  Eigen::JacobiSVD<Mat3> ex(excitation), svd(cross, Eigen::ComputeFullU|Eigen::ComputeFullV);
-  r.rotation_ratio = ex.singularValues()(2) / std::max(1e-12, ex.singularValues()(0));
-  Mat3 U = svd.matrixU();
-  Mat3 V = svd.matrixV();
-  Mat3 sign = Mat3::Identity();
-  sign(2,2) = (U*V.transpose()).determinant() < 0 ? -1 : 1;
-  r.R_B_M = U*sign*V.transpose();
-  std::vector<Mat3> Cs;
-  std::vector<Vec3> ys;
-  Mat3 mean_C = Mat3::Zero();
-  Vec3 mean_y = Vec3::Zero();
-  const Vec3 gravity(0,0,-9.80665);
-  double agreement = 0;
-  for (size_t i = 0; i < ms.size(); ++i) {
-    const auto &m = ms[i]; const auto &b = bs[i];
-    r.gyro_rmse += (b.w-r.R_B_M*m.w).squaredNorm();
-    r.imu_gyro_rms += b.w.squaredNorm();
-    r.odom_gyro_rms += m.w.squaredNorm();
-    agreement += b.w.dot(r.R_B_M*m.w);
-    r.alpha_rms += m.alpha.squaredNorm();
-    const Mat3 C = r.R_B_M*(skew(m.alpha)+skew(m.w)*skew(m.w));
-    const Vec3 y = b.a-initial_accel_bias+b.R_EB.transpose()*gravity-r.R_B_M*m.a;
-    Cs.push_back(C); ys.push_back(y); mean_C += C; mean_y += y;
+  Eigen::JacobiSVD<Mat3> ex(excitation),svd(cross,Eigen::ComputeFullU|Eigen::ComputeFullV);
+  r.rotation_ratio=ex.singularValues()(2)/std::max(1e-12,ex.singularValues()(0));
+  Mat3 sign=Mat3::Identity();
+  sign(2,2)=(svd.matrixU()*svd.matrixV().transpose()).determinant()<0 ? -1:1;
+  r.R_B_M=svd.matrixU()*sign*svd.matrixV().transpose();
+  double agreement=0;
+  for(size_t i=0;i<motion.size();++i) {
+    r.gyro_rmse+=(body[i].w-r.R_B_M*motion[i].w).squaredNorm();
+    r.imu_gyro_rms+=body[i].w.squaredNorm();
+    r.odom_gyro_rms+=motion[i].w.squaredNorm();
+    agreement+=body[i].w.dot(r.R_B_M*motion[i].w);
+    r.alpha_rms+=motion[i].alpha.squaredNorm();
   }
-  r.gyro_rmse = std::sqrt(r.gyro_rmse/ms.size());
-  const double denominator = std::sqrt(r.imu_gyro_rms*r.odom_gyro_rms);
-  if (denominator > 1e-12) r.gyro_correlation = std::max(-1.0,std::min(1.0,agreement/denominator));
-  r.imu_gyro_rms = std::sqrt(r.imu_gyro_rms/ms.size());
-  r.odom_gyro_rms = std::sqrt(r.odom_gyro_rms/ms.size());
-  const double signal_rms = std::sqrt(0.5*(r.imu_gyro_rms*r.imu_gyro_rms+
-                                          r.odom_gyro_rms*r.odom_gyro_rms));
-  if (signal_rms > 1e-9) r.gyro_relative_rmse = r.gyro_rmse/signal_rms;
-  r.alpha_rms = std::sqrt(r.alpha_rms/ms.size());
-  mean_C /= ms.size(); mean_y /= ms.size();
-  Eigen::MatrixXd C0(3*ms.size(),3);
-  Eigen::VectorXd y0(3*ms.size());
-  for (size_t i = 0; i < ms.size(); ++i) {
-    C0.block<3,3>(3*i,0) = Cs[i]-mean_C;
-    y0.segment<3>(3*i) = ys[i]-mean_y;
+  const double denominator=std::sqrt(r.imu_gyro_rms*r.odom_gyro_rms);
+  if(denominator>1e-12)r.gyro_correlation=std::max(-1.0,std::min(1.0,agreement/denominator));
+  r.gyro_rmse=std::sqrt(r.gyro_rmse/motion.size());
+  r.imu_gyro_rms=std::sqrt(r.imu_gyro_rms/motion.size());
+  r.odom_gyro_rms=std::sqrt(r.odom_gyro_rms/motion.size());
+  r.alpha_rms=std::sqrt(r.alpha_rms/motion.size());
+  const double signal=std::sqrt(0.5*(r.imu_gyro_rms*r.imu_gyro_rms+r.odom_gyro_rms*r.odom_gyro_rms));
+  if(signal>1e-9)r.gyro_relative_rmse=r.gyro_rmse/signal;
+  return true;
+}
+inline bool fitLever(const std::vector<LeverEquation> &equations,const Vec3 &initial_bias,Result &r) {
+  const size_t count=equations.size();
+  if(count<10) { r.reasons.push_back("有效杆臂方程不足");return false; }
+  Eigen::MatrixXd C(3*count,3),D(3*count,3);
+  Eigen::VectorXd y(3*count);
+  for(size_t i=0;i<count;++i) {
+    C.block<3,3>(3*i,0)=equations[i].C;
+    D.block<3,3>(3*i,0)=equations[i].D;
+    y.segment<3>(3*i)=equations[i].y;
   }
-  // Eliminate the constant bias before checking observability. This is the
-  // Schur complement of the full six-unknown [lever arm, bias] system.
-  Eigen::JacobiSVD<Eigen::MatrixXd> trans(C0, Eigen::ComputeThinU|Eigen::ComputeThinV);
-  const auto singular = trans.singularValues();
-  r.translation_excitation = singular(2)/std::sqrt(static_cast<double>(ms.size()));
-  if (singular(2) > 1e-10) r.translation_condition = singular(0)/singular(2);
-  const Vec3 inverse_lever = trans.solve(y0);
-  r.t_B_M = -r.R_B_M*inverse_lever;
-  r.accel_bias = initial_accel_bias+mean_y-mean_C*inverse_lever;
-  r.accel_rmse = (C0*inverse_lever-y0).norm()/std::sqrt(static_cast<double>(ms.size()));
+  // Project out the bias subspace. Unlike simple mean subtraction this also
+  // supports the rotating, integrated body-bias basis of matched windows.
+  const auto bias_qr=D.colPivHouseholderQr();
+  if(bias_qr.rank()<3) { r.reasons.push_back("加速度偏置子系统退化");return false; }
+  const Eigen::MatrixXd Cp=C-D*bias_qr.solve(C);
+  const Eigen::VectorXd yp=y-D*bias_qr.solve(y);
+  Eigen::JacobiSVD<Eigen::MatrixXd> svd(Cp,Eigen::ComputeThinU|Eigen::ComputeThinV);
+  const auto singular=svd.singularValues();
+  r.translation_excitation=singular(2)/std::sqrt(static_cast<double>(count));
+  if(singular(2)>1e-10)r.translation_condition=singular(0)/singular(2);
+  const Vec3 inverse_lever=svd.solve(yp);
+  const Vec3 residual_bias=bias_qr.solve(y-C*inverse_lever);
+  r.t_B_M=-r.R_B_M*inverse_lever;
+  r.accel_bias=initial_bias+residual_bias;
+  r.accel_rmse=(C*inverse_lever+D*residual_bias-y).norm()/std::sqrt(static_cast<double>(count));
+  return true;
+}
+inline void validateResult(const Limits &lim,Result &r) {
   if (!r.R_B_M.allFinite() || !r.t_B_M.allFinite() || !r.accel_bias.allFinite() ||
       !std::isfinite(r.gyro_rmse) || !std::isfinite(r.accel_rmse)) r.reasons.push_back("求解出现非有限数值");
   if (r.rotation_ratio < lim.min_rotation_ratio) r.reasons.push_back("三轴旋转激励不充分");
@@ -224,6 +221,26 @@ inline Result solve(const std::vector<Motion> &motion, const std::vector<Imu> &i
   if (r.alpha_rms < lim.min_alpha_rms) r.reasons.push_back("角加速度不足，请避免只做匀速转动");
   if (r.t_B_M.norm() > lim.max_lever_arm) r.reasons.push_back("杆臂超过配置的物理尺寸上限");
   r.accepted = r.reasons.empty();
-  return r;
+}
+
+// Instantaneous equations for exact motion inputs. Pose trajectories must use
+// solveTrajectory(), which matches both sides of the differentiation filter.
+inline Result solve(const std::vector<Motion> &motion,const std::vector<Imu> &imu,
+                    const Vec3 &gyro_bias,const Vec3 &initial_accel_bias,const Limits &lim) {
+  Result r;std::vector<Motion> ms;std::vector<Imu> bs;
+  for(const auto &m:motion) {
+    Imu b;
+    if(!interpolate(imu,m.t,lim.max_imu_gap,b))continue;
+    b.w-=gyro_bias;ms.push_back(m);bs.push_back(b);
+  }
+  if(!fitRotation(ms,bs,lim,r))return r;
+  std::vector<LeverEquation> equations;
+  for(size_t i=0;i<ms.size();++i) {
+    const auto &m=ms[i];const auto &b=bs[i];
+    equations.push_back({r.R_B_M*(skew(m.alpha)+skew(m.w)*skew(m.w)),Mat3::Identity(),
+      b.a-initial_accel_bias+b.R_EB.transpose()*Vec3(0,0,-9.80665)-r.R_B_M*m.a});
+  }
+  if(!fitLever(equations,initial_accel_bias,r))return r;
+  validateResult(lim,r);return r;
 }
 }  // namespace mid360_calibration

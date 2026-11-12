@@ -50,7 +50,8 @@ min_samples: 1500
 min_odom_samples: 300
 min_motion_samples: 150
 
-# Local cubic pose fit over +/- 0.3 s; rejects gaps and stage boundaries.
+# Matched pose/IMU integration over +/- 0.3 s; rejects gaps and stage boundaries.
+# Gyro quality metrics compare relative-rotation averages over the same window.
 derivative_half_window_s: 0.3
 max_gyro_rmse_rad_s: 0.12
 # Relative RMSE uses the symmetric RMS energy of the paired gyro vectors.

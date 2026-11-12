@@ -1,6 +1,7 @@
 #include <mid360_px4_calibration/calibration_math.h>
 #include <mid360_px4_calibration/static_window.h>
 #include <mid360_px4_calibration/handling_gate.h>
+#include <mid360_px4_calibration/matched_solver.h>
 #include <iostream>
 #include <stdexcept>
 #include <random>
@@ -191,18 +192,19 @@ void differentiationTest() {
   motion=mc::differentiate(poses,lim,{{1,19}});
   for (const auto &m:motion) require(m.t<8.85 || m.t>10.13,"derivative fit bridged a tracking gap");
 }
-void trajectoryTest() {
+void trajectoryTest(bool noisy=true,unsigned seed=42,double amplitude=0.4,
+                    const std::vector<int> &rates={10,20,50,200}) {
   Fixture truth;
   mc::Limits lim;
-  std::mt19937 rng(42);
+  std::mt19937 rng(seed);
   std::normal_distribution<double> noise(0,1);
   auto model=[&](double t,mc::Pose &p,mc::Imu &b) {
     const int axis=std::min(2,static_cast<int>(t/20));
     const double u=t-axis*20, k=2*3.141592653589793/5;
     const double sn=std::sin(k*u),cs=std::cos(k*u);
-    const double angle=0.4*sn*sn*sn;
-    const double rate=1.2*k*sn*sn*cs;
-    const double accel=1.2*k*k*(2*sn*cs*cs-sn*sn*sn);
+    const double angle=amplitude*sn*sn*sn;
+    const double rate=3*amplitude*k*sn*sn*cs;
+    const double accel=3*amplitude*k*k*(2*sn*cs*cs-sn*sn*sn);
     Vec3 unit=Vec3::Zero();unit[axis]=1;
     const Mat3 RB=Eigen::AngleAxisd(angle,unit).toRotationMatrix();
     const Mat3 RM=RB*truth.R;
@@ -214,34 +216,106 @@ void trajectoryTest() {
     p={t,pm,RM};
     b={t,unit*rate+truth.gb,RB.transpose()*(ab_world-Vec3(0,0,-9.80665))+truth.ab,RB};
   };
-  for (const int hz:{10,20,50,200}) {
+  for (const int hz:rates) {
     std::vector<mc::Pose> poses;
     std::vector<mc::Imu> imu;
     for (int i=0;i<=60*hz;++i) {
       mc::Pose p;mc::Imu b;
       model(i/static_cast<double>(hz),p,b);
-      p.p+=Vec3(noise(rng),noise(rng),noise(rng))*0.0005;
-      p.R_WM=p.R_WM*Eigen::AngleAxisd(0.0002*noise(rng),Vec3::UnitX()).toRotationMatrix();
+      p.p+=Vec3(noise(rng),noise(rng),noise(rng))*(noisy ? 0.0005:0);
+      p.R_WM=p.R_WM*Eigen::AngleAxisd((noisy ? 0.0002:0)*noise(rng),Vec3::UnitX()).toRotationMatrix();
       poses.push_back(p);
     }
     for (int i=0;i<=6000;++i) {
       mc::Pose p;mc::Imu b;model(i*0.01,p,b);
-      b.w+=Vec3(noise(rng),noise(rng),noise(rng))*0.003;
-      b.a+=Vec3(noise(rng),noise(rng),noise(rng))*0.02;
+      b.w+=Vec3(noise(rng),noise(rng),noise(rng))*(noisy ? 0.003:0);
+      b.a+=Vec3(noise(rng),noise(rng),noise(rng))*(noisy ? 0.02:0);
       imu.push_back(b);
     }
-    auto motion=mc::differentiate(poses,lim,{{0,20},{20,40},{40,60}});
-    const auto result=mc::solve(motion,imu,truth.gb,Vec3::Zero(),lim);
+    const auto result=mc::solveTrajectory(poses,imu,{{0,20},{20,40},{40,60}},truth.gb,Vec3::Zero(),lim);
     require(result.accepted,"noisy three-axis trajectory rejected");
     require(mc::logSO3(result.R_B_M*truth.R.transpose()).norm()<0.01,"trajectory rotation error too large");
-    require((result.t_B_M-truth.lever).norm()<0.02,"trajectory lever error exceeds 2 cm");
-    std::cout<<"trajectory "<<hz<<" Hz: lever error "<<(result.t_B_M-truth.lever).norm()
+    require((result.t_B_M-truth.lever).norm()<(noisy ? 0.002:0.0001),"trajectory lever error exceeds matched-solver accuracy bound");
+    std::cout<<(noisy ? "noisy":"noiseless")<<" seed "<<seed<<" trajectory "<<hz<<" Hz: lever error "<<(result.t_B_M-truth.lever).norm()
              <<" m, gyro RMSE "<<result.gyro_rmse<<", accel RMSE "<<result.accel_rmse<<"\n";
+    if(!noisy && amplitude<0.1) {
+      for(auto &b:imu) {
+        const double t=b.t;
+        b.w=truth.gb+Vec3(0.085*std::sin(2.4*t),0.085*std::sin(2.8*t),0.085*std::sin(3.2*t));
+      }
+      const auto bad=mc::solveTrajectory(poses,imu,{{0,20},{20,40},{40,60}},truth.gb,Vec3::Zero(),lim);
+      require(bad.gyro_rmse<lim.max_gyro_rmse && !bad.accepted &&
+              bad.gyro_relative_rmse>lim.max_gyro_relative_rmse,"matched low-amplitude gyro mismatch was accepted");
+    }
+  }
+}
+void coupledTrajectoryTest(bool noisy) {
+  Fixture truth;mc::Limits lim;
+  const double epoch=1700000000.0;
+  const Mat3 world=(Eigen::AngleAxisd(-1.0,Vec3::UnitZ())*Eigen::AngleAxisd(0.6,Vec3::UnitX())).toRotationMatrix();
+  const Vec3 offset(100,-20,3);
+  std::mt19937 rng(90);std::normal_distribution<double> noise(0,1);
+  auto model=[&](double t,mc::Pose &p,mc::Imu &b) {
+    const double a=0.25*std::sin(t),ad=0.25*std::cos(t),add=-0.25*std::sin(t);
+    const double c=0.35*std::sin(1.7*t),cd=0.595*std::cos(1.7*t),cdd=-1.0115*std::sin(1.7*t);
+    const double y=0.3*std::sin(1.3*t),yd=0.39*std::cos(1.3*t),ydd=-0.507*std::sin(1.3*t);
+    const Mat3 A=Eigen::AngleAxisd(a,Vec3::UnitX()).toRotationMatrix();
+    const Mat3 B=Eigen::AngleAxisd(y,Vec3::UnitY()).toRotationMatrix();
+    const Mat3 C=Eigen::AngleAxisd(c,Vec3::UnitZ()).toRotationMatrix();
+    const Mat3 X=mc::skew(Vec3::UnitX()),Y=mc::skew(Vec3::UnitY()),Z=mc::skew(Vec3::UnitZ());
+    const Mat3 Ap=A*X*ad,Bp=B*Y*yd,Cp=C*Z*cd;
+    const Mat3 App=A*(X*add+X*X*ad*ad),Bpp=B*(Y*ydd+Y*Y*yd*yd),Cpp=C*(Z*cdd+Z*Z*cd*cd);
+    const Mat3 RB=A*B*C;
+    const Mat3 Rd=Ap*B*C+A*Bp*C+A*B*Cp;
+    const Mat3 Rdd=App*B*C+A*Bpp*C+A*B*Cpp+2*(Ap*Bp*C+Ap*B*Cp+A*Bp*Cp);
+    const Mat3 W=RB.transpose()*Rd;
+    const Vec3 gyro(W(2,1),W(0,2),W(1,0));
+    const Vec3 pm(0.1*std::sin(0.3*t)+0.02*t,0.1*std::cos(0.4*t)-0.03*t,0.1*std::sin(0.2*t));
+    const Vec3 am(-0.009*std::sin(0.3*t),-0.016*std::cos(0.4*t),-0.004*std::sin(0.2*t));
+    p={epoch+t,world*pm+offset,world*RB*truth.R};
+    const Vec3 accworld=am+Rdd*truth.R*(-truth.R.transpose()*truth.lever);
+    b={epoch+t,gyro+truth.gb,RB.transpose()*(accworld-Vec3(0,0,-9.80665))+truth.ab,RB};
+  };
+  std::vector<mc::Pose> poses;std::vector<mc::Imu> imu;
+  for(int i=0;i<=1500;++i) {
+    const double t=i*0.02+0.001*std::sin(0.3*i);
+    mc::Pose p;mc::Imu b;model(t,p,b);
+    if(noisy) {
+      p.p+=Vec3(noise(rng),noise(rng),noise(rng))*0.0005;
+      p.R_WM=p.R_WM*Eigen::AngleAxisd(0.0002*noise(rng),Vec3::UnitX()).toRotationMatrix();
+    }
+    poses.push_back(p);
+  }
+  for(int i=0;i<=3000;++i) {
+    const double t=i*0.01+0.0004*std::sin(0.7*i);
+    mc::Pose p;mc::Imu b;model(t,p,b);
+    if(noisy) {
+      b.w+=Vec3(noise(rng),noise(rng),noise(rng))*0.003;
+      b.a+=Vec3(noise(rng),noise(rng),noise(rng))*0.02;
+      b.R_EB=b.R_EB*Eigen::AngleAxisd(0.0003*noise(rng),Vec3::UnitY()).toRotationMatrix();
+    }
+    imu.push_back(b);
+  }
+  const std::vector<mc::Interval> windows={{epoch,epoch+10},{epoch+10,epoch+20},{epoch+20,epoch+30}};
+  const auto r=mc::solveTrajectory(poses,imu,windows,truth.gb,Vec3::Zero(),lim);
+  require(r.accepted,"coupled rotations / epoch stamps / non-ENU world rejected");
+  const double error=(r.t_B_M-truth.lever).norm();
+  require(error<(noisy ? 0.002:0.0001),"coupled trajectory lever accuracy bound exceeded");
+  require(mc::logSO3(r.R_B_M*truth.R.transpose()).norm()<0.002,"coupled rotation accuracy bound exceeded");
+  require((r.accel_bias-truth.ab).norm()<0.01,"rotating acceleration bias not recovered");
+  std::cout<<(noisy ? "noisy":"noiseless")<<" coupled/non-ENU/irregular/epoch: lever error "<<error<<" m\n";
+  if(!noisy) {
+    auto gap=imu;
+    gap.erase(std::remove_if(gap.begin(),gap.end(),[&](const mc::Imu &b){return b.t>epoch+12 && b.t<epoch+13;}),gap.end());
+    const auto g=mc::solveTrajectory(poses,gap,windows,truth.gb,Vec3::Zero(),lim);
+    require(g.accepted && g.samples<r.samples && (g.t_B_M-truth.lever).norm()<0.0001,"IMU gap was interpolated or biased valid windows");
+    for(auto &b:imu)b.t+=100;
+    require(!mc::solveTrajectory(poses,imu,windows,truth.gb,Vec3::Zero(),lim).accepted,"non-overlapping trajectory streams accepted");
   }
 }
 int main() {
   try {
-    interpolationTest(); staticTest(); staticWindowTest(); relativeGyroTest(); handlingGateTest(); recoveryTest(); degeneracyTest(); overlapTest(); differentiationTest(); trajectoryTest();
+    interpolationTest(); staticTest(); staticWindowTest(); relativeGyroTest(); handlingGateTest(); recoveryTest(); degeneracyTest(); overlapTest(); differentiationTest(); trajectoryTest(false); trajectoryTest(); trajectoryTest(true,7); trajectoryTest(true,123); coupledTrajectoryTest(false); coupledTrajectoryTest(true); trajectoryTest(false,42,0.05,{200});
     std::cout<<"PASS: pickup confirmation, static restart/attitude gates, relative gyro consistency, interpolation, extrinsics, bias degeneracy, overlap, derivatives, 10/20/50/200 Hz\n";
     return 0;
   } catch (const std::exception &e) { std::cerr<<"FAIL: "<<e.what()<<"\n"; return 1; }
