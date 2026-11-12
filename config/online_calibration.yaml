@@ -1,29 +1,52 @@
-# C++ LI-Init-style online calibration parameters.
+# MAVROS must provide FLU body vectors and an ENU-referenced attitude.
+# FAST-LIO world is a local initialization frame; it need not be ENU.
 slam_odom_topic: "/Odometry"
 body_imu_topic: "/mavros/imu/data"
+body_accel_scale: 1.0  # m/s^2; set 9.80665 only for acceleration in g
+body_gyro_scale: 1.0   # rad/s
 
-# ROS-side convention: MAVROS publishes the IMU in the ROS body frame
-# (normally base_link / FLU); ROS local/world coordinates are ENU. No extra
-# NED/FRD conversion is applied by this node.
+# Aligned IMU stamp = raw IMU stamp + this offset (seconds).
+# No automatic time-offset estimation. Synchronize clocks first.
+imu_time_offset_s: 0.0
+max_imu_gap_s: 0.1
+max_odom_gap_s: 0.25
 
-# Convert raw topic units to SI units before calibration.
-# Use 9.80665 if the corresponding accelerometer publishes in g.
-body_accel_scale: 1.0
-body_gyro_scale: 1.0
+# Writable by the current user, including when running an installed package.
+# Absolute and package-relative paths are also supported. Parents are created.
+output_yaml: "~/.ros/mid360_px4_calibration/result.yaml"
+output_txt: "~/.ros/mid360_px4_calibration/result.txt"
 
-# Output paths are relative to this package unless absolute paths are used.
-output_yaml: "config/online_calibration_result.yaml"
-output_txt: "config/online_calibration_result.txt"
-
-# LI-Init-style automatic collection: initial static period, then three
-# sequential excitation stages. X reaches 100% before Y starts, and Y reaches
-# 100% before Z starts. The default timeout is zero: wait indefinitely instead
-# of running a calibration with insufficient motion.
+# Stable windows use sample timestamps and validate gyro RMS/accel variation.
 static_duration_s: 8.0
-settle_duration_s: 5.0
-static_validation_duration_s: 3.0
-motion_timeout_s: 0.0
+neutral_duration_s: 2.0
+static_validation_duration_s: 5.0
+static_timeout_s: 120.0
+min_static_samples: 100
+
+# Each axis: at least 20 s of data, 8 s of active movement, both directions.
+# Keep rocking naturally after reaching an angle target until time/data pass.
+axis_min_duration_s: 20.0
+axis_min_active_s: 8.0
+axis_direction_target_rad: 1.5  # cumulative per direction, NOT one large tilt
+motion_rate_threshold_rad_s: 0.08
+axis_min_imu_samples: 300
+axis_min_odom_samples: 80
+motion_timeout_s: 180.0
 motion_update_period_s: 0.25
-axis_excitation_target_rad: 2.5
+startup_timeout_s: 30.0
+data_timeout_s: 2.0
+max_recording_duration_s: 900.0
 min_samples: 1500
-min_odom_samples: 30
+min_odom_samples: 300
+min_motion_samples: 150
+
+# Local cubic pose fit over +/- 0.3 s; rejects gaps and stage boundaries.
+derivative_half_window_s: 0.3
+max_gyro_rmse_rad_s: 0.12
+max_accel_rmse_m_s2: 0.75
+min_rotation_excitation_ratio: 0.02
+# These apply AFTER eliminating the constant acceleration bias.
+max_translation_condition: 1000.0
+min_translation_excitation_rad_s2: 0.03
+min_angular_accel_rms_rad_s2: 0.1
+max_lever_arm_m: 2.0  # physical installation-size ceiling; adjust for your rig

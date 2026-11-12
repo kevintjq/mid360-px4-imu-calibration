@@ -1,60 +1,84 @@
-# Mid360/PX4 IMU Extrinsic Calibration
+# Mid360 / PX4 IMU Extrinsic Calibration
 
-English | [中文](README_CN.md)
+English | [中文操作说明](README_CN.md)
 
-ROS1 / Ubuntu 20.04 C++ calibration for the FAST-LIO body (Mid360 built-in IMU) relative to a PX4 IMU. The node reads `/Odometry` and `/mavros/imu/data`; it publishes no topics and writes YAML/TXT results.
-
-## Coordinate frames and target
-
-FAST-LIO `header.frame_id` (normally `camera_init`) is a local world frame created at startup. It is not automatically ENU. `child_frame_id` (normally `body`) is the FAST-LIO body frame and must correspond to the Mid360 IMU frame. PX4 data uses `base_link` with ROS FLU axes: X forward, Y left, Z up.
-
-The fixed target is the transform from FAST-LIO body `M` to PX4 IMU `B`:
-
-```text
-T_B_M = [ R_B_M  t_B_M ]
-        [   0      1   ]
-```
-
-`t_B_M` is the Mid360/FAST-LIO body origin relative to the PX4 IMU origin, expressed in PX4 FLU. This is the fixed installation offset to use. The reported ENU vector is only `t_B_M` rotated by the MAVROS attitude at `enu_reference_stamp`; it is not a fixed world-frame extrinsic.
-
-## Calibration method
-
-1. **Static initialization.** The node collects a static window and estimates the PX4 gyro bias. It also uses the PX4 ENU attitude and gravity (`[0, 0, -9.80665]` m/s²) to estimate the static accelerometer bias. Keep the rigid assembly still during this step.
-2. **Excitation collection.** Roll, pitch, and yaw are collected sequentially. Each axis must reach the target angle in both directions. Progress requires both PX4 gyro motion and a corresponding change in FAST-LIO odometry quaternions. Move slowly, with clear acceleration and deceleration; a constant-rate rotation is insufficient for the lever arm.
-3. **Quaternion angular motion.** The node ignores the commonly-zero `Odometry.twist` fields. For adjacent FAST-LIO orientations it computes
-   `delta_R = R_i^T R_(i+1)`, then `omega_M = Log(delta_R) / dt`. Angular acceleration is obtained by differentiating these body-frame angular velocities. The FAST-LIO pose quaternion is therefore the direct source of rotational motion.
-4. **Rotation alignment.** At overlapping timestamps, PX4 angular velocity and FAST-LIO angular velocity are matched by an SVD orthogonal Procrustes solve to estimate `R_B_M`. The gyro RMSE is reported as an independent rotation consistency check.
-5. **Lever-arm translation.** FAST-LIO pose positions are differentiated with a wider time window to obtain linear acceleration in the FAST-LIO body frame. The rigid-body relation is solved in batch:
-
-   `a_B - R_B_M a_M = R_B_M (alpha_M x t_M_B + omega_M x (omega_M x t_M_B)) + bias`
-
-   where `t_M_B` is the inverse-convention translation used internally. The resulting value is converted to `t_B_M`, the output convention described above. Translation is accepted only when the system is well-conditioned and has sufficient angular acceleration.
-6. **Validation.** After yaw reaches 100%, the node provides a settling period, then requires a final static window. It rejects results with insufficient samples, failed static validation, large residuals, or a rank-deficient translation system.
-
-This is an excitation-based batch estimate, not a guarantee of accuracy from a single run. Repeat the calibration and compare the fixed FLU result with a physical measurement before using it in flight software.
-
-## Topics and configuration
-
-```yaml
-slam_odom_topic: "/Odometry"
-body_imu_topic: "/mavros/imu/data"
-```
-
-The odometry pose must be metric and time-overlapped with the IMU streams. Adjust scale parameters only when the driver units require it.
+ROS1 / Ubuntu 20.04 C++ calibration of the FAST-LIO body relative to a PX4 FLU body reference. Reads `/Odometry` and `/mavros/imu/data`, guides motion collection, and batch-estimates rotation, lever arm, and a combined accelerometer bias. Publishes no flight-control messages.
 
 ## Build and run
 
 ```bash
 sudo apt install ros-noetic-roscpp ros-noetic-roslib ros-noetic-sensor-msgs \
   ros-noetic-nav-msgs libeigen3-dev
-mkdir -p ~/catkin_ws/src && cd ~/catkin_ws/src
+mkdir -p ~/catkin_ws/src
+cd ~/catkin_ws/src
 git clone https://github.com/kevintjq/mid360-px4-imu-calibration.git
-cd .. && catkin_make
+cd ~/catkin_ws
+catkin_make
 source devel/setup.bash
 roslaunch mid360_px4_calibration online_calibration.launch
 ```
 
-Keep still during initialization, follow roll/pitch/yaw prompts, then place the assembly down during the settling period and keep it still for final validation. Outputs are `config/online_calibration_result.yaml` and `.txt`.
+Start MAVROS and FAST-LIO first. Odometry must remain tracked and metric. IMU input must contain valid ENU-referenced attitude, FLU body angular velocity in rad/s, and accelerometer specific force including gravity in m/s². The streams must share a time base. Invalid data and duplicate/out-of-order stamps are discarded; changing frame IDs aborts collection.
+
+## Motion procedure
+
+Keep the assembly rigid. The terminal displays Chinese operation prompts, progress, elapsed/active time, positive/negative rotation totals, and sample counts. A TTY refreshes in place; redirected logs produce plain periodic updates. Set `NO_COLOR=1` to disable colors.
+
+| Stage | Operation | Default requirement |
+| --- | --- | --- |
+| Initialization | Rest on a stable surface | 8 s of stable data, at least 100 IMU samples |
+| Before each axis | Return to a comfortable neutral pose and pause | 2 s of stable data |
+| Roll | Gently rock left/right around the body's front-back axis, about ±20–35° | At least 20 s |
+| Pitch | Gently tilt forward/back around the body's left-right axis, about ±20–35° | At least 20 s |
+| Yaw | Stay approximately level and turn left/right, about ±30–45° | At least 20 s |
+| Final validation | Put down gently and let vibration stop | 5 s of stable data, at least 100 IMU samples |
+
+Use natural acceleration/deceleration, about 3–5 s per rocking cycle and typically 3–5 cycles per axis. Continue smoothly until all requirements pass. Avoid abrupt shaking, continuous spinning, or large translation. Each direction must accumulate **1.5 rad (~86°)**; this is cumulative, not a requested single tilt.
+
+Each axis also requires at least 8 s of active motion, 300 IMU samples, 80 odometry samples, and corresponding odometry rotation. All requirements must pass together. Odometry rotation is measured independently of mounting orientation, so a 90° mounting rotation does not block collection by requiring matching axis names. Motion alone takes at least 60 s; a complete run normally takes roughly 1.5–3 minutes. Each axis times out after 180 s rather than waiting forever.
+
+Static checks use bias-corrected gyro RMS, gyro/acceleration variation, sample count, window duration, and continuity. Opposite rotations cannot cancel to pass the check. Movement after putting the assembly down extends the wait automatically. Missing/stale data and timeouts produce explicit errors.
+
+## Frames and outputs
+
+The transform is defined by:
+
+```text
+p_B = R_B_M * p_M + t_B_M
+```
+
+`M` must be the Mid360 IMU body represented by FAST-LIO, and `B` is the MAVROS PX4 FLU body reference. Verify that their reference origins match the configuration consuming the result. `t_B_M` is the Mid360 origin relative to the PX4 reference origin, expressed in FLU.
+
+FAST-LIO world (usually `camera_init`) need not be ENU: position derivatives are transformed back to the FAST-LIO body. The ENU translation is only the fixed FLU lever arm rotated at `enu_reference_stamp`, not a fixed world-frame extrinsic.
+
+Default files are `~/.ros/mid360_px4_calibration/result.yaml` and `result.txt`. Parent directories are created. Absolute, `~/`, and package-relative paths are supported. Files are written and checked before individual renames; the two renames are not a cross-file atomic transaction, and partial save failures return an error. Rejected calibrations do not overwrite existing results.
+
+Files include rotation matrix, quaternion `[x,y,z,w]`, fixed FLU translation, reference ENU translation, gyro/combined accelerometer bias, timestamp offset convention, quality metrics, thresholds, and motion windows. The matrix/quaternion replace the ambiguous legacy `rpy_mid360_to_body_XYZ_deg` field; `translation_body_FLU_m` remains a translation alias.
+
+## Estimation and quality gates
+
+- Record the actual initialization sample boundaries, avoiding startup delays contaminating bias estimates with later movement.
+- Fit local cubic polynomials to position and local rotation logarithms (default half-window 0.3 s) to estimate acceleration, angular velocity, and angular acceleration. Ignore usually-zero odometry twist, stage boundaries, long gaps, and static samples that could dilute motion residuals.
+- Interpolate strictly inside the IMU time range and reject long gaps. Estimate rotation with SVD and check three-axis excitation plus gyro vector RMSE.
+- Solve the rigid-body acceleration relation for lever arm and constant combined bias. Eliminate the bias before testing the lever-arm condition number and weakest-direction excitation, accounting for their joint observability.
+- Accept only with adequate rotation consistency, acceleration residual, angular acceleration, and physical lever-arm length. Report every failed quality gate and save only accepted results.
+
+See [config/online_calibration.yaml](config/online_calibration.yaml) for all parameters. Defaults include gyro vector RMSE ≤0.12 rad/s, acceleration vector RMSE ≤0.75 m/s², rotation excitation ratio ≥0.02, bias-eliminated translation condition ≤1000, weakest translation excitation ≥0.03 rad/s², and lever-arm length ≤2 m.
+
+**Time offset is not estimated automatically.** `aligned_imu_stamp = raw_imu_stamp + imu_time_offset_s`, with default zero. Synchronize clocks first and set a nonzero value only for a known offset. Investigate timing, units, tracking, and rigid mounting before relaxing thresholds. Defaults reject clearly poor data; they do not guarantee accuracy. Repeat runs and compare the fixed FLU offset against physical measurements.
+
+## Tests
+
+The numerical tests need Eigen but no ROS:
+
+```bash
+cd ~/catkin_ws/src/mid360-px4-imu-calibration
+c++ -std=c++14 -O1 -Iinclude -I/usr/include/eigen3 \
+  tests/calibration_math_test.cpp -o /tmp/calibration_math_test
+/tmp/calibration_math_test
+```
+
+Alternatively, after `catkin_make`, enter `~/catkin_ws/build` and run `ctest --output-on-failure -R calibration_math_test`. Coverage includes known extrinsics and bias recovery, 90° mounting, bias-confounded degeneracy, oscillatory static rejection, strict time overlap/gap handling, irregular-sampling derivatives, and noisy three-axis trajectories at 10/20/50 Hz. Synthetic tests do not replace real ROS/rosbag and hardware validation.
 
 ## License
 

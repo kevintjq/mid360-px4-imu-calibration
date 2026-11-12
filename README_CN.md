@@ -1,59 +1,101 @@
-# Mid360/PX4 IMU 外参标定
+# Mid360 / PX4 IMU 外参标定
 
 [English](README.md) | 中文
 
-这是一个 ROS1 / Ubuntu 20.04 C++ 标定工程，用于计算 FAST-LIO 机体系（Mid360 内置 IMU）相对 PX4 飞控 IMU 的固定外参。程序读取 `/Odometry` 和 `/mavros/imu/data`，不发布任何话题，结果写入 YAML/TXT。
-
-## 坐标系和目标
-
-FAST-LIO 的 `header.frame_id`（通常是 `camera_init`）是启动时建立的局部世界系，不自动等于 ENU。`child_frame_id`（通常是 `body`）是 FAST-LIO 机体系，必须确认它对应 Mid360 内置 IMU。PX4 使用 `base_link` 和 ROS FLU 轴：X 前、Y 左、Z 上。
-
-固定目标是 FAST-LIO body `M` 到 PX4 IMU `B` 的变换：
-
-```text
-T_B_M = [ R_B_M  t_B_M ]
-        [   0      1   ]
-```
-
-`t_B_M` 表示 Mid360/FAST-LIO body 原点相对 PX4 IMU 原点的位置，表达在 PX4 FLU 坐标系。这是实际应使用的固定安装偏移。程序输出的 ENU 向量只是将 `t_B_M` 按 `enu_reference_stamp` 时刻的 MAVROS 姿态旋转后的结果，不是固定世界系外参。
-
-## 标定思路
-
-1. **静止初始化。** 程序采集一段静止数据，估计 PX4 陀螺仪零偏；同时使用 PX4 的 ENU 姿态和重力向量 `[0, 0, -9.80665]` m/s² 估计静止加速度偏置。此阶段必须保持整体静止。
-2. **三轴激励。** 按 roll、pitch、yaw 顺序采集。每个轴都要有正反方向的明显转动，并达到目标角度。进度条同时要求 PX4 陀螺仪有运动、FAST-LIO odom 四元数也发生对应变化。请缓慢转动并有明显加速、减速；只匀速转动无法充分估计杆臂。
-3. **四元数求角运动。** 程序不使用通常为 0 的 `Odometry.twist`。对相邻 FAST-LIO 姿态计算：`delta_R = R_i^T R_(i+1)`，再用 `omega_M = Log(delta_R) / dt` 得到 body 系角速度；对角速度差分得到角加速度。因此旋转运动直接来自 FAST-LIO pose 四元数。
-4. **旋转外参。** 在时间重叠的采样点，将 PX4 角速度和 FAST-LIO 角速度进行 SVD 正交 Procrustes 匹配，求得 `R_B_M`。输出的 gyro RMSE 用于检查两个 IMU 的旋转一致性。
-5. **平移杆臂。** 对 FAST-LIO pose 位置使用较宽时间窗口差分，得到 FAST-LIO body 系线加速度，并批量求解刚体关系：
-
-   `a_B - R_B_M a_M = R_B_M (alpha_M x t_M_B + omega_M x (omega_M x t_M_B)) + bias`
-
-   其中 `t_M_B` 是程序内部使用的反向平移约定，最后转换为本文定义的 `t_B_M` 输出。只有平移方程条件良好、角加速度充分时才接受结果。
-6. **最终验证。** yaw 到 100% 后，程序先给出放置缓冲时间，再采集最终静止窗口。样本不足、静止验证失败、残差过大或平移方程秩退化时，程序会拒绝结果。
-
-这是基于运动激励的批量估计，单次运行不能自动保证绝对精度。建议重复标定，并将固定 FLU 结果与尺量安装尺寸对照后再用于飞控或飞行软件。
-
-## 话题和参数
-
-```yaml
-slam_odom_topic: "/Odometry"
-body_imu_topic: "/mavros/imu/data"
-```
-
-odom 位姿必须是米制，并且与 IMU 话题有重叠时间。只有驱动单位不同时才修改 scale 参数。
+ROS1 / Ubuntu 20.04 C++ 工具。读取 FAST-LIO `/Odometry` 和 MAVROS `/mavros/imu/data`，通过引导式运动采集，批量估计固定旋转、杆臂和加速度组合偏置。不会向飞控发布数据。
 
 ## 编译运行
 
 ```bash
 sudo apt install ros-noetic-roscpp ros-noetic-roslib ros-noetic-sensor-msgs \
   ros-noetic-nav-msgs libeigen3-dev
-mkdir -p ~/catkin_ws/src && cd ~/catkin_ws/src
+mkdir -p ~/catkin_ws/src
+cd ~/catkin_ws/src
 git clone https://github.com/kevintjq/mid360-px4-imu-calibration.git
-cd .. && catkin_make
+cd ~/catkin_ws
+catkin_make
 source devel/setup.bash
 roslaunch mid360_px4_calibration online_calibration.launch
 ```
 
-启动时保持静止，按提示完成 roll/pitch/yaw；三轴完成后利用放置缓冲时间放下设备，再保持静止完成最终验证。结果写入 `config/online_calibration_result.yaml` 和 `.txt`。
+先启动 MAVROS 和 FAST-LIO，确认里程计持续跟踪、位姿单位为米。IMU 必须提供有效的 ENU 姿态、FLU 机体系角速度（rad/s）和含重力的加速度计比力（m/s²）。IMU 和里程计应有共同的时间基准；无效姿态、重复/乱序时间戳会被丢弃，坐标系变化会中止采集。
+
+## 怎样操作
+
+设备应保持刚性连接，并在 FAST-LIO 能稳定跟踪的环境中操作。终端显示当前步骤、进度、时间、正反向累计转角和样本量。交互式终端原地刷新；重定向日志时每两秒输出一次，不包含颜色控制码。设置 `NO_COLOR=1` 可关闭颜色。
+
+| 步骤 | 操作 | 默认要求 |
+| --- | --- | --- |
+| 静止初始化 | 放在稳定平面上，完全静止 | 连续稳定窗口 8 秒，至少 100 帧 IMU |
+| 每轴准备 | 回到舒适的中间姿态，短暂停稳 | 稳定 2 秒 |
+| 横滚 Roll | 绕机体前后轴左右倾斜约 ±20–35°，再缓慢返回 | 至少 20 秒 |
+| 俯仰 Pitch | 绕机体左右轴前后俯仰约 ±20–35°，再缓慢返回 | 至少 20 秒 |
+| 偏航 Yaw | 尽量保持水平，左右转向约 ±30–45°，再缓慢返回 | 至少 20 秒 |
+| 最终静止 | 轻放在稳定平面上，等振动停止后保持静止 | 连续稳定窗口 5 秒，至少 100 帧 IMU |
+
+每次往复约 3–5 秒，自然加速、减速，通常每轴做 3–5 次；进度未满时继续平滑往复。不要猛甩、连续转圈或大幅平移。角度是操作建议，程序检查的是**两个方向各累计至少 1.5 rad（约 86°）**，不要求一次倾斜 86°。
+
+每轴还必须满足：有效运动至少 8 秒、至少 300 帧 IMU 和 80 帧 odom，以及对应的里程计整体旋转量。时间、转角、样本量全部满足才进入下一步。安装旋转未知时，不要求两个传感器的同名轴同时变化。默认三轴运动至少 60 秒，完整流程通常需要约 1.5–3 分钟，未达标会继续等待；每轴最多等待 180 秒。
+
+静止检查使用去偏角速度 **RMS**、角速度波动、加速度波动和数据连续性，正反转动不会相互抵消。设备放下后的晃动会自动延长等待。断流、无有效数据或采集超时会给出明确原因。
+
+## 坐标系与结果
+
+输出定义为：
+
+```text
+p_B = R_B_M * p_M + t_B_M
+```
+
+`M` 是 FAST-LIO body，必须确认其原点和轴对应 Mid360 IMU；`B` 是 MAVROS 提供的 PX4 FLU 机体系。`t_B_M` 是 Mid360 原点相对 PX4 参考原点的位置，表达在 PX4 FLU 中。用于硬件安装偏移前，应确认数据所用参考原点与目标配置一致。
+
+FAST-LIO 世界系（通常为 `camera_init`）不必是 ENU。程序只利用世界系位置求导后转回 body，不把该世界系直接当作 ENU。输出的 ENU 平移只是固定 FLU 杆臂在 `enu_reference_stamp` 时刻的旋转表达，不是固定世界系外参。
+
+默认结果：
+
+- `~/.ros/mid360_px4_calibration/result.yaml`
+- `~/.ros/mid360_px4_calibration/result.txt`
+
+父目录自动创建。支持 `~/`、绝对路径、相对包目录的路径。先写临时文件、检查写入成功，再逐个重命名；两个文件不构成跨文件原子事务，部分保存失败也会报错并返回非零。未通过标定验收时不会覆盖已有结果。
+
+YAML/TXT 包含旋转矩阵、四元数 `[x,y,z,w]`、固定 FLU 平移、参考时刻的 ENU 平移、陀螺仪及加速度组合偏置、时间补偿约定、质量指标、阈值和采集时间段。新版旋转输出使用矩阵和四元数，替代含义容易混淆的 `rpy_mid360_to_body_XYZ_deg` 字段；保留 `translation_body_FLU_m` 作为平移别名。
+
+## 求解与验收
+
+1. 初始静止窗口直接记录采样起止时刻，估计陀螺仪偏置与加速度初始偏置，避免启动延迟把后续运动混进初始化。
+2. 在三段运动窗口内，对位置和局部旋转对数做局部三次多项式拟合，求线加速度、角速度、角加速度。默认半窗口 0.3 秒，不使用经常为零的 `Odometry.twist`；不跨阶段边界或长缺帧区间求导，静止样本不用于稀释运动残差。
+3. 只在 IMU 有效范围内插值，拒绝越界和过长间隔。利用角速度 SVD 配准估计旋转，检查三轴激励和角速度匹配 RMSE。
+4. 根据刚体加速度关系联合估计杆臂与常量加速度组合偏置。先消去偏置，再检查杆臂系统的条件数及最弱方向绝对激励，避免只检查原始前三列导致误接受。
+5. 检查旋转误差、加速度残差、角加速度和物理尺寸上限；通过后才保存。具体失败项会在终端列出。
+
+主要参数见 [config/online_calibration.yaml](config/online_calibration.yaml)：
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `imu_time_offset_s` | 0 | 对齐后的 IMU 时间 = 原始 IMU 时间 + 此值 |
+| `axis_min_duration_s` / `axis_min_active_s` | 20 / 8 | 每轴最短采集时间 / 最短有效运动时间（秒） |
+| `axis_direction_target_rad` | 1.5 | 正、反每个方向的累计目标转角 |
+| `max_gyro_rmse_rad_s` | 0.12 | 配对运动角速度向量 RMSE 上限 |
+| `max_accel_rmse_m_s2` | 0.75 | 加速度向量 RMSE 上限 |
+| `min_rotation_excitation_ratio` | 0.02 | 角速度激励矩阵最小/最大奇异值比下限 |
+| `max_translation_condition` | 1000 | 消去偏置后的杆臂系统条件数上限 |
+| `min_translation_excitation_rad_s2` | 0.03 | 最小奇异值除以样本数平方根的下限 |
+| `max_lever_arm_m` | 2 | 安装杆臂物理长度上限，可按设备收紧 |
+
+**不自动估计时间偏移。** 先保证驱动时钟同步；仅在已知偏移时设置 `imu_time_offset_s`。角速度误差大时优先检查时钟、单位和刚性连接，不应直接放宽验收阈值。这些默认阈值是拒绝明显不良数据的起点，不代表某种精度保证。建议重复采集，将固定 FLU 杆臂与尺量尺寸对照。
+
+## 测试
+
+核心数值测试不依赖 ROS：
+
+```bash
+cd ~/catkin_ws/src/mid360-px4-imu-calibration
+c++ -std=c++14 -O1 -Iinclude -I/usr/include/eigen3 \
+  tests/calibration_math_test.cpp -o /tmp/calibration_math_test
+/tmp/calibration_math_test
+```
+
+也可在 `catkin_make` 后进入 `~/catkin_ws/build`，运行 `ctest --output-on-failure -R calibration_math_test`。测试覆盖已知旋转/杆臂/偏置恢复、90° 安装方向、偏置耦合退化、往复运动静止误判、时间不重叠、插值缺帧和不均匀采样求导，并包含 10/20/50 Hz 带噪声的三轴轨迹。合成测试不能替代真实 ROS/rosbag 和实机验证。
 
 ## 许可证
 

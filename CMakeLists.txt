@@ -11,11 +11,13 @@ find_package(catkin REQUIRED COMPONENTS
 find_package(Eigen3 REQUIRED)
 
 catkin_package(
+  INCLUDE_DIRS include
   CATKIN_DEPENDS roscpp roslib sensor_msgs nav_msgs
   DEPENDS EIGEN3
 )
 
 include_directories(
+  include
   ${catkin_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIRS}
 )
@@ -33,3 +35,14 @@ install(DIRECTORY
   launch
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
+
+
+install(DIRECTORY include/${PROJECT_NAME}/
+  DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINATION}
+)
+
+if(CATKIN_ENABLE_TESTING)
+  add_executable(calibration_math_test tests/calibration_math_test.cpp)
+  target_compile_features(calibration_math_test PRIVATE cxx_std_14)
+  add_test(NAME calibration_math_test COMMAND calibration_math_test)
+endif()
