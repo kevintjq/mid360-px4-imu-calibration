@@ -4,6 +4,8 @@
 #include <nav_msgs/Odometry.h>
 #include <mid360_px4_calibration/calibration_math.h>
 #include <mid360_px4_calibration/static_window.h>
+#include <mid360_px4_calibration/terminal_ui.h>
+#include <mid360_px4_calibration/handling_gate.h>
 
 #include <cerrno>
 #include <clocale>
@@ -30,62 +32,7 @@ std::string number(double x, int precision = 2) {
 std::string vectorText(const Vec3 &v) {
   return "[" + number(v.x(),9) + ", " + number(v.y(),9) + ", " + number(v.z(),9) + "]";
 }
-class Terminal {
- public:
-  Terminal() : tty_(isatty(STDOUT_FILENO)), color_(tty_ && !std::getenv("NO_COLOR")) {}
-  ~Terminal() { clear(); }
-  void clear() {
-    if (tty_ && lines_) std::cout << "\033[" << lines_ << "A\033[J";
-    lines_ = 0;
-  }
-  void message(const std::string &s, bool error = false) {
-    clear(); std::cout << tint(error ? "31" : "36") << s << reset() << "\n" << std::flush;
-  }
-  void panel(const std::string &title, double progress, const std::vector<std::string> &details) {
-    const double now = ros::WallTime::now().toSec();
-    if (!tty_ && now-last_print_ < 2.0) return;
-    last_print_ = now;
-    clear();
-    const int filled = std::max(0,std::min(24,static_cast<int>(progress*24)));
-    const int percent=static_cast<int>(std::min(1.0,std::max(0.0,progress))*100);
-    const std::string heading="◆ Mid360 / PX4  ·  "+title;
-    std::cout << tint("1;36") << heading << reset() << "\n";
-    std::cout << tint("32");
-    for (int i=0;i<24;++i) std::cout << (i<filled ? "━" : "·");
-    std::cout << "  " << percent << "%" << reset() << "\n";
-    for (const auto &s : details) std::cout << "  " << s << "\n";
-    std::cout << std::flush;
-    if (tty_) {
-      struct winsize ws {};
-      const int columns=ioctl(STDOUT_FILENO,TIOCGWINSZ,&ws)==0 && ws.ws_col ? ws.ws_col : 80;
-      lines_=rows(heading,columns)+rows(std::string(24,'-')+"  "+std::to_string(percent)+"%",columns);
-      for (const auto &detail:details) lines_+=rows("  "+detail,columns);
-    }
-  }
- private:
-  static size_t rows(const std::string &s,int columns) {
-    std::mbstate_t state {};
-    size_t offset=0,count=1;
-    int column=0;
-    while (offset<s.size()) {
-      wchar_t ch;
-      size_t bytes=std::mbrtowc(&ch,s.data()+offset,s.size()-offset,&state);
-      int width=1;
-      if (bytes==static_cast<size_t>(-1) || bytes==static_cast<size_t>(-2) || bytes==0) {
-        bytes=1; state=std::mbstate_t{};
-      } else width=std::max(0,::wcwidth(ch));
-      if (column+width>columns) { ++count; column=0; }
-      column+=width;offset+=bytes;
-    }
-    return count;
-  }
-  const char *tint(const std::string &code) {
-    escape_ = color_ ? "\033["+code+"m" : ""; return escape_.c_str();
-  }
-  const char *reset() const { return color_ ? "\033[0m" : ""; }
-  bool tty_, color_; size_t lines_ = 0; double last_print_ = -1e9;
-  std::string escape_;
-};
+using Terminal = mc::Terminal;
 
 class Calibrator {
  public:
@@ -102,6 +49,10 @@ class Calibrator {
     param("neutral_duration_s", neutral_s_, 2.0);
     param("static_max_rotation_deg", static_rotation_deg_, 1.0);
     param("static_timeout_s", static_timeout_, 120.0);
+    param("pickup_min_duration_s", pickup_min_s_, 5.0);
+    param("pickup_min_displacement_m", pickup_distance_, 0.08);
+    param("pickup_timeout_s", pickup_timeout_, 120.0);
+    param("putdown_buffer_s", putdown_s_, 5.0);
     param("axis_min_duration_s", axis_min_s_, 20.0);
     param("axis_min_active_s", active_s_, 8.0);
     param("axis_direction_target_rad", direction_rad_, 1.5);
@@ -133,6 +84,8 @@ class Calibrator {
     if (!std::isfinite(imu_offset_) || !positive(accel_scale_) || !positive(gyro_scale_) ||
         !positive(static_s_) || !positive(validation_s_) || !positive(neutral_s_) ||
         !positive(static_timeout_) || !positive(static_rotation_deg_) || static_rotation_deg_>=180 ||
+        !positive(pickup_min_s_) || !positive(pickup_distance_) || !positive(pickup_timeout_) ||
+        pickup_timeout_<=pickup_min_s_ || !positive(putdown_s_) ||
         !positive(axis_min_s_) || !positive(active_s_) ||
         !positive(direction_rad_) || !positive(motion_rate_) || !positive(motion_timeout_) ||
         !positive(update_s_) || update_s_ > 1 || !positive(data_timeout_) ||
@@ -153,12 +106,15 @@ class Calibrator {
     sub_odom_ = nh_.subscribe(odom_topic_, 500, &Calibrator::odomCallback, this);
   }
   int run() {
-    ui_.message("开始外参标定 · 全程请保持传感器刚性连接，并确保 FAST-LIO 正常跟踪。");
-    ui_.message("流程：静止初始化 → 三轴往复运动（每轴至少 "+number(axis_min_s_,0)+" 秒）→ 静止验证 → 求解。");
+    ui_.summary("准备开始",{
+      "按提示完成操作，达到要求后自动进入下一步。",
+      "桌面静止 → 拿起飞机 → 手持三轴往复 → 放下 → 验收",
+      "每轴至少 "+number(axis_min_s_,0)+" 秒；拿起、放下过程不参与求解。",
+      "IMU  "+imu_topic_,"ODOM "+odom_topic_});
     started_ = ros::WallTime::now().toSec();
     if (!waitForData()) return fail();
     double begin = 0, end = 0;
-    if (!collectStill("1 / 6  静止初始化",static_s_,true,min_static_,begin,end)) return fail();
+    if (!collectStill("02 / 08  桌面静止初始化",static_s_,true,min_static_,begin,end)) return fail();
     const auto stats = mc::staticStats(imu_,begin,end,Vec3::Zero(),limits_.max_imu_gap);
     gyro_bias_ = stats.gyro_mean;
     size_t n = 0;
@@ -168,21 +124,22 @@ class Calibrator {
     if (!n) { error_="初始化窗口没有有效姿态样本"; return fail(); }
     accel_bias_ /= n;
     ui_.message("✓ 静止初始化完成 · 陀螺仪偏置 "+vectorText(gyro_bias_)+" rad/s");
+    if (!waitForPickup()) return fail();
     const char *names[] = {"横滚 ROLL / X", "俯仰 PITCH / Y", "偏航 YAW / Z"};
     const char *help[] = {
       "绕机体前后轴左右倾斜约 ±20–35°，再缓慢返回；往复 3–5 次。",
       "绕机体左右轴前后俯仰约 ±20–35°，再缓慢返回；往复 3–5 次。",
       "尽量保持水平，左右转向约 ±30–45°，再缓慢返回；往复 3–5 次。"};
     for (int axis=0; axis<3; ++axis) {
-      if (!collectStill("准备 · 放回中间姿态并短暂停稳",neutral_s_,false,20,begin,end)) return fail();
+      if (!collectStill("0"+std::to_string(axis+4)+" / 08  "+names[axis]+" · 手持居中",neutral_s_,false,20,begin,end,true)) return fail();
       if (!collectAxis(axis,names[axis],help[axis])) return fail();
     }
-    ui_.message("✓ 三轴采集完成 · 请轻放在稳定平面上，等待振动停止；静止窗口会自动重新计时。");
-    if (!collectStill("5 / 6  最终静止验证",validation_s_,false,min_static_,begin,end)) return fail();
+    if (!waitForPutdown()) return fail();
+    if (!collectStill("07 / 08  放稳后的静止验证",validation_s_,false,min_static_,begin,end)) return fail();
     if (imu_.size()<static_cast<size_t>(min_samples_) || odom_.size()<static_cast<size_t>(min_odom_)) {
       error_="总样本不足，请检查话题频率；IMU="+std::to_string(imu_.size())+"，odom="+std::to_string(odom_.size()); return fail();
     }
-    ui_.message("6 / 6  求解 · 平滑位姿求导、旋转配准、消除偏置后检查杆臂可观测性……");
+    ui_.panel("08 / 08  求解与质量验收",0,{"采集完成，请稍候。","正在计算旋转、杆臂和质量指标……"});
     const auto motion = mc::differentiate(odom_,limits_,windows_);
     const mc::Result r = mc::solve(motion,imu_,gyro_bias_,accel_bias_,limits_);
     report(r);
@@ -190,7 +147,9 @@ class Calibrator {
       ui_.message("未通过质量验收，未覆盖已有结果。请按上面的原因重新采集。",true); return 3;
     }
     if (!writeResults(r)) return fail();
-    ui_.message("✓ 标定通过并已保存\n  YAML: "+resolvedPath(output_yaml_)+"\n  TXT:  "+resolvedPath(output_txt_));
+    ui_.summary("✓ 标定完成 · 结果已保存",{
+      "FLU 偏移 (m)  "+vectorText(r.t_B_M),
+      "YAML  "+resolvedPath(output_yaml_),"TXT   "+resolvedPath(output_txt_)});
     return 0;
   }
  private:
@@ -248,10 +207,14 @@ class Calibrator {
     while (ros::ok() && error_.empty()) {
       spinFor(update_s_);
       const double elapsed=ros::WallTime::now().toSec()-start;
-      ui_.panel("等待有效话题",elapsed/startup_timeout_,{
-        imu_topic_+" · "+std::to_string(imu_.size())+" 帧（需要有效姿态）",
-        odom_topic_+" · "+std::to_string(odom_.size())+" 帧",
-        "等待 "+number(elapsed,1)+" / "+number(startup_timeout_,0)+" 秒"});
+      ui_.panel("01 / 08  连接数据源",elapsed/startup_timeout_,{
+        "请先启动 MAVROS 与 FAST-LIO，保持飞机放稳。",
+        "等待有效姿态、递增时间戳及两路共同时间范围。"},
+        {{"IMU 样本",static_cast<double>(imu_.size()),2,"帧",0},
+         {"ODOM 样本",static_cast<double>(odom_.size()),2,"帧",0},
+         {"时间差",(!imu_.empty() && !odom_.empty()) ? std::abs(imu_.back().t-odom_.back().t) : std::numeric_limits<double>::infinity(),data_timeout_,"s（上限）",2,false},
+         {"消息间隔",(!imu_.empty() && !odom_.empty()) ? ros::WallTime::now().toSec()-std::min(last_imu_wall_,last_odom_wall_) : std::numeric_limits<double>::infinity(),data_timeout_,"s（上限）",2,false},
+         {"等待时间",elapsed,startup_timeout_,"s（上限）",1,false}});
       const double now=ros::WallTime::now().toSec();
       if (imu_.size()>=2 && odom_.size()>=2 && now-last_imu_wall_<data_timeout_ &&
           now-last_odom_wall_<data_timeout_ && std::abs(imu_.back().t-odom_.back().t)<data_timeout_) return true;
@@ -259,7 +222,44 @@ class Calibrator {
     }
     return false;
   }
-  bool collectStill(const std::string &name,double duration,bool initial,int min_count,double &begin,double &end) {
+  bool waitForPickup() {
+    mc::PickupGate gate(odom_.back(),pickup_min_s_,pickup_distance_,limits_.max_odom_gap);
+    size_t checked=odom_.size();
+    const double start=ros::WallTime::now().toSec();
+    ui_.message("请拿起飞机 · 离开原位置约 "+number(pickup_distance_*100+2,0)+" cm 以上，然后手持停稳。无需按键。");
+    while (healthy()) {
+      spinFor(update_s_);
+      if(!healthy())return false;
+      for(;checked<odom_.size();++checked)gate.push(odom_[checked]);
+      ui_.panel("03 / 08  拿起飞机",gate.progress(),{
+        "现在拿起飞机，动作放轻；这一阶段不记录标定运动。",
+        "确认离开原位置后，会提示你手持居中并停稳。"},
+        {{"准备时间",gate.elapsed(),pickup_min_s_,"s",1},
+         {"离开原位",gate.distance()*100,pickup_distance_*100,"cm",1},
+         {"位移确认",gate.awayDuration(),0.5,"s",1}});
+      if(gate.ready()) { ui_.message("✓ 已检测到离开原位置 · 接下来保持手持，不必放回桌面。");return true; }
+      if(ros::WallTime::now().toSec()-start>pickup_timeout_) {
+        error_="等待拿起飞机超时；请确认实际拿起且里程计位置正常更新";return false;
+      }
+    }
+    return false;
+  }
+  bool waitForPutdown() {
+    const double start=ros::WallTime::now().toSec();
+    ui_.message("✓ 三轴采集完成 · 现在可以把飞机轻放回桌面或地面。");
+    while(healthy()) {
+      spinFor(update_s_);
+      if(!healthy())return false;
+      const double elapsed=ros::WallTime::now().toSec()-start;
+      ui_.panel("07 / 08  放下飞机",elapsed/putdown_s_,{
+        "将飞机轻放在稳定平面上，松手并等待晃动停止。",
+        "放下过程不参与求解；随后还需完整静止 "+number(validation_s_,0)+" 秒。"},
+        {{"放置缓冲",elapsed,putdown_s_,"s",1}});
+      if(elapsed>=putdown_s_)return true;
+    }
+    return false;
+  }
+  bool collectStill(const std::string &name,double duration,bool initial,int min_count,double &begin,double &end,bool handheld=false) {
     const double wall_start=ros::WallTime::now().toSec();
     mc::StaticLimits limits;
     limits.duration=duration;
@@ -288,12 +288,16 @@ class Calibrator {
       }
       const auto state=window.evaluate();
       const auto &stats=state.stats;
+      const double unavailable=std::numeric_limits<double>::infinity();
       ui_.panel(name,std::min(1.0,state.stable_s/duration),{
-        "将设备放稳，连续静止 "+number(duration,0)+" 秒；检测到运动后完整重新计时。",
-        "连续静止 "+number(state.stable_s,1)+" / "+number(duration,0)+" 秒 · 样本 "+std::to_string(stats.samples)+" / 至少 "+std::to_string(min_count),
-        "角速度 RMS "+number(stats.gyro_rms,3)+" rad/s · 加速度波动 "+number(stats.accel_std,3)+" m/s²",
-        "IMU 姿态变化 "+number(state.rotation_rad*180/M_PI,2)+"° · 两路姿态上限 "+number(static_rotation_deg_,1)+"°",
-        state.reason});
+        handheld ? "保持手持，回到舒适的中间姿态，短暂停稳。" : "将飞机放在稳定平面上，松手并保持静止。",
+        "检测到运动后完整重新计时。"+state.reason},
+        {{"连续静止",state.stable_s,duration,"s",1},
+         {"有效样本",static_cast<double>(stats.samples),static_cast<double>(min_count),"帧",0},
+         {"姿态变化",stats.samples ? state.rotation_rad*180/M_PI : unavailable,static_rotation_deg_,"deg（上限）",2,false},
+         {"角速度 RMS",stats.samples ? stats.gyro_rms : unavailable,limits.max_gyro,"rad/s（上限）",3,false},
+         {"角速度波动",stats.samples ? stats.gyro_std : unavailable,limits.max_gyro_std,"rad/s（上限）",3,false},
+         {"加速度波动",stats.samples ? stats.accel_std : unavailable,limits.max_accel_std,"m/s²（上限）",3,false}});
       if (state.ready) { begin=state.begin;end=state.end;ui_.clear();return true; }
       if (ros::WallTime::now().toSec()-wall_start>static_timeout_) {
         error_="静止采集超时，检查振动、姿态漂移、话题频率、时间戳和加速度单位"; return false;
@@ -330,13 +334,16 @@ class Calibrator {
       const double progress=std::min({elapsed/axis_min_s_,active/active_s_,pos/direction_rad_,neg/direction_rad_,
         odom_angle/(2*direction_rad_*0.6),static_cast<double>(imu_count)/axis_min_imu_,
         static_cast<double>(odom_count)/axis_min_odom_});
-      ui_.panel(std::to_string(axis+2)+" / 6  "+name,progress,{
+      ui_.panel("0"+std::to_string(axis+4)+" / 08  "+name,progress,{
         help,
-        "每次约 3–5 秒，自然加速、减速；不要猛甩、连续转圈或大幅平移。",
-        "采集时间 "+number(elapsed,1)+" / 至少 "+number(axis_min_s_,0)+" 秒 · 有效运动 "+number(active,1)+" / "+number(active_s_,0)+" 秒",
-        "正向累计 "+number(pos*180/M_PI,0)+"° · 反向累计 "+number(neg*180/M_PI,0)+"° · 各需 "+number(direction_rad_*180/M_PI,0)+"°",
-        "IMU "+std::to_string(imu_count)+" / "+std::to_string(axis_min_imu_)+" · odom "+std::to_string(odom_count)+" / "+std::to_string(axis_min_odom_),
-        progress>=1 ? "数据达标，准备进入下一阶段" : "保持本轴往复运动；里程计丢失跟踪时先停止操作"});
+        "每次往复约 3–5 秒，自然加减速；继续手持，不要猛甩或连续转圈。"},
+        {{"采集时长",elapsed,axis_min_s_,"s",1},
+         {"有效运动",active,active_s_,"s",1},
+         {"正向转角",pos*180/M_PI,direction_rad_*180/M_PI,"deg",0},
+         {"反向转角",neg*180/M_PI,direction_rad_*180/M_PI,"deg",0},
+         {"IMU 样本",static_cast<double>(imu_count),static_cast<double>(axis_min_imu_),"帧",0},
+         {"ODOM 样本",static_cast<double>(odom_count),static_cast<double>(axis_min_odom_),"帧",0},
+         {"里程计转动",odom_angle*180/M_PI,2*direction_rad_*0.6*180/M_PI,"deg",0}});
       if (progress>=1) {
         windows_.push_back({start,std::min(imu_.back().t,odom_.back().t)});
         ui_.message("✓ "+name+" 完成 · "+number(elapsed,1)+" 秒 · 正 / 反 "+number(pos*180/M_PI,0)+"° / "+number(neg*180/M_PI,0)+"°"); return true;
@@ -348,20 +355,29 @@ class Calibrator {
     return false;
   }
   void report(const mc::Result &r) {
-    const std::string status=r.accepted ? "✓ 质量验收通过" : "✗ 质量验收未通过";
-    ui_.message(status+"\n  有效运动配对: "+std::to_string(r.samples)+
-      "\n  角速度 RMSE: "+number(r.gyro_rmse,4)+" / "+number(limits_.max_gyro_rmse,3)+" rad/s"+
-      "\n  角速度相对误差: "+number(r.gyro_relative_rmse*100,1)+"%（至多 "+number(limits_.max_gyro_relative_rmse*100,0)+"%）"+
-      "\n  角速度一致性: "+number(r.gyro_correlation,4)+"（至少 "+number(limits_.min_gyro_correlation,2)+"）"+
-      "\n  加速度 RMSE: "+number(r.accel_rmse,4)+" / "+number(limits_.max_accel_rmse,3)+" m/s²"+
-      "\n  三轴激励比: "+number(r.rotation_ratio,4)+"（至少 "+number(limits_.min_rotation_ratio,3)+"）"+
-      "\n  杆臂条件数: "+number(r.translation_condition,2)+"（至多 "+number(limits_.max_translation_condition,0)+"）"+
-      "\n  杆臂最弱方向激励: "+number(r.translation_excitation,4)+"（至少 "+number(limits_.min_translation_excitation,3)+" rad/s²）"+
-      "\n  角加速度 RMS: "+number(r.alpha_rms,4)+"（至少 "+number(limits_.min_alpha_rms,3)+" rad/s²）"+
-      "\n  丢弃无效/乱序帧: IMU "+std::to_string(dropped_imu_)+" · odom "+std::to_string(dropped_odom_),!r.accepted);
-    for (const auto &reason:r.reasons) ui_.message("  · "+reason,true);
-    if (r.accepted) ui_.message("固定安装偏移（Mid360 原点相对 PX4，FLU，米）: "+vectorText(r.t_B_M));
+    if(r.samples<limits_.min_motion_samples) {
+      ui_.summary("✗ 有效运动配对不足",{"未进行完整求解，请检查数据源、时间同步和采样频率。"},
+        {{"运动配对 ↑",static_cast<double>(r.samples),static_cast<double>(limits_.min_motion_samples),"帧",0}},false);
+      for(const auto &reason:r.reasons)ui_.message("  · "+reason,true);
+      return;
+    }
+    ui_.summary(r.accepted ? "✓ 质量验收通过 · 正在保存" : "✗ 未通过质量验收",{
+      r.accepted ? "所有质量门限已通过。" : "请根据失败项检查数据并重新采集。",
+      "每项显示：实测值 / 验收门限；箭头说明门限方向。"},
+      {{"运动配对 ↑",static_cast<double>(r.samples),static_cast<double>(limits_.min_motion_samples),"帧",0},
+       {"角速度误差 ↓",r.gyro_rmse,limits_.max_gyro_rmse,"rad/s",4,false},
+       {"相对误差 ↓",r.gyro_relative_rmse*100,limits_.max_gyro_relative_rmse*100,"%",1,false},
+       {"运动一致性 ↑",r.gyro_correlation,limits_.min_gyro_correlation,"",4},
+       {"加速度误差 ↓",r.accel_rmse,limits_.max_accel_rmse,"m/s²",4,false},
+       {"三轴激励比 ↑",r.rotation_ratio,limits_.min_rotation_ratio,"",4},
+       {"杆臂条件数 ↓",r.translation_condition,limits_.max_translation_condition,"",2,false},
+       {"最弱方向激励 ↑",r.translation_excitation,limits_.min_translation_excitation,"rad/s²",4},
+       {"角加速度 RMS ↑",r.alpha_rms,limits_.min_alpha_rms,"rad/s²",4},
+       {"杆臂长度 ↓",r.t_B_M.norm(),limits_.max_lever_arm,"m",3,false}},r.accepted);
+    for(const auto &reason:r.reasons)ui_.message("  · "+reason,true);
+    ui_.message("数据统计 · 丢弃无效/乱序帧：IMU "+std::to_string(dropped_imu_)+"，ODOM "+std::to_string(dropped_odom_));
   }
+
   static std::string resolvedPath(const std::string &path) {
     if (path.empty()) throw std::runtime_error("输出路径为空");
     if (path.substr(0,2)=="~/") {
@@ -429,7 +445,10 @@ class Calibrator {
         <<"\n  min_translation_excitation_rad_s2: "<<limits_.min_translation_excitation
         <<"\n  min_angular_accel_rms_rad_s2: "<<limits_.min_alpha_rms
         <<"\n  max_lever_arm_m: "<<limits_.max_lever_arm<<"\n"
-        <<"collection:\n  static_max_rotation_deg: "<<static_rotation_deg_
+        <<"collection:\n  pickup_min_duration_s: "<<pickup_min_s_
+        <<"\n  pickup_min_displacement_m: "<<pickup_distance_
+        <<"\n  putdown_buffer_s: "<<putdown_s_
+        <<"\n  static_max_rotation_deg: "<<static_rotation_deg_
         <<"\n  invalid_or_out_of_order_imu: "<<dropped_imu_
         <<"\n  invalid_or_out_of_order_odom: "<<dropped_odom_<<"\n  axes:\n";
       for (const auto &window:windows_) fy<<"    - {begin: "<<window.begin<<", end: "<<window.end
@@ -463,6 +482,7 @@ class Calibrator {
   std::string imu_topic_,odom_topic_,output_yaml_,output_txt_,body_frame_,world_frame_,mid_frame_,error_;
   double accel_scale_,gyro_scale_,imu_offset_,static_s_,validation_s_,neutral_s_,static_timeout_,static_rotation_deg_;
   double axis_min_s_,active_s_,direction_rad_,motion_rate_,motion_timeout_,update_s_;
+  double pickup_min_s_,pickup_distance_,pickup_timeout_,putdown_s_;
   double data_timeout_,startup_timeout_,recording_timeout_,started_=0,last_imu_wall_=0,last_odom_wall_=0;
   int min_static_,axis_min_imu_,axis_min_odom_,min_samples_,min_odom_;
   size_t dropped_imu_=0,dropped_odom_=0;

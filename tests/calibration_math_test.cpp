@@ -1,5 +1,6 @@
 #include <mid360_px4_calibration/calibration_math.h>
 #include <mid360_px4_calibration/static_window.h>
+#include <mid360_px4_calibration/handling_gate.h>
 #include <iostream>
 #include <stdexcept>
 #include <random>
@@ -121,6 +122,23 @@ void relativeGyroTest() {
   require(!result.accepted && result.gyro_correlation>0.999 &&
           result.gyro_relative_rmse>limits.max_gyro_relative_rmse,"gyro scale mismatch was accepted");
 }
+void handlingGateTest() {
+  const mc::Pose reference{1,Vec3::Zero(),Mat3::Identity()};
+  mc::PickupGate gate(reference,5,0.08,0.25);
+  for(int i=1;i<=1200;++i) gate.push({1+i*0.005,Vec3::Zero(),Mat3::Identity()});
+  require(!gate.ready(),"pickup advanced while aircraft remained on table");
+  for(int i=1;i<=80;++i)gate.push({7+i*0.005,Vec3(0,0,0.2),Mat3::Identity()});
+  require(!gate.ready(),"pickup confirmation period was skipped");
+  gate.push({7.6,Vec3(0,0,0.2),Mat3::Identity()});
+  require(gate.ready(),"confirmed pickup did not advance");
+  gate.push({7.61,Vec3::Zero(),Mat3::Identity()});
+  require(!gate.ready(),"returning to the table bypassed pickup gate");
+  gate.push({8,Vec3(0,0,0.2),Mat3::Identity()});
+  require(!gate.ready(),"odometry gap preserved an old pickup confirmation");
+  mc::PickupGate early(reference,5,0.08,0.25);
+  for(int i=1;i<=800;++i)early.push({1+i*0.005,Vec3(0.2,0,0),Mat3::Identity()});
+  require(!early.ready(),"minimum pickup preparation time was skipped");
+}
 void recoveryTest() {
   Fixture f; mc::Limits lim;
   auto r=mc::solve(f.motion,f.imu,f.gb,Vec3::Zero(),lim);
@@ -223,8 +241,8 @@ void trajectoryTest() {
 }
 int main() {
   try {
-    interpolationTest(); staticTest(); staticWindowTest(); relativeGyroTest(); recoveryTest(); degeneracyTest(); overlapTest(); differentiationTest(); trajectoryTest();
-    std::cout<<"PASS: static restart/attitude gates, relative gyro consistency, interpolation, extrinsics, bias degeneracy, overlap, derivatives, 10/20/50/200 Hz\n";
+    interpolationTest(); staticTest(); staticWindowTest(); relativeGyroTest(); handlingGateTest(); recoveryTest(); degeneracyTest(); overlapTest(); differentiationTest(); trajectoryTest();
+    std::cout<<"PASS: pickup confirmation, static restart/attitude gates, relative gyro consistency, interpolation, extrinsics, bias degeneracy, overlap, derivatives, 10/20/50/200 Hz\n";
     return 0;
   } catch (const std::exception &e) { std::cerr<<"FAIL: "<<e.what()<<"\n"; return 1; }
 }

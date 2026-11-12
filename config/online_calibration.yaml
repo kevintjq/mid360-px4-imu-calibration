@@ -16,6 +16,13 @@ max_odom_gap_s: 0.25
 output_yaml: "~/.ros/mid360_px4_calibration/result.yaml"
 output_txt: "~/.ros/mid360_px4_calibration/result.txt"
 
+# Explicit handling stages exclude picking up / putting down from the solve.
+# Pickup waits for actual odometry displacement, not just a countdown.
+pickup_min_duration_s: 5.0
+pickup_min_displacement_m: 0.08
+pickup_timeout_s: 120.0
+putdown_buffer_s: 5.0
+
 # Stable windows use sample timestamps and validate gyro RMS/accel variation.
 static_duration_s: 8.0
 neutral_duration_s: 2.0

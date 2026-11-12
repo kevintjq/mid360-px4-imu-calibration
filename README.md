@@ -1,10 +1,10 @@
 # Mid360 / PX4 IMU Extrinsic Calibration
 
-English | [中文操作说明](README_CN.md)
+English · [中文操作说明](README_CN.md)
 
-ROS1 / Ubuntu 20.04 C++ calibration of the FAST-LIO body relative to a PX4 FLU body reference. Reads `/Odometry` and `/mavros/imu/data`, guides motion collection, and batch-estimates rotation, lever arm, and a combined accelerometer bias. Publishes no flight-control messages.
+ROS1 / Ubuntu 20.04 C++ tool that reads FAST-LIO `/Odometry` and MAVROS `/mavros/imu/data`, guides an eight-step collection, and batch-estimates rotation, lever arm, and combined acceleration bias. It publishes no flight-control messages.
 
-## Build and run
+## Quick start
 
 ```bash
 sudo apt install ros-noetic-roscpp ros-noetic-roslib ros-noetic-sensor-msgs \
@@ -13,67 +13,101 @@ mkdir -p ~/catkin_ws/src
 cd ~/catkin_ws/src
 git clone https://github.com/kevintjq/mid360-px4-imu-calibration.git
 cd ~/catkin_ws
-catkin_make
+catkin_make -DCMAKE_BUILD_TYPE=Release
 source devel/setup.bash
 roslaunch mid360_px4_calibration online_calibration.launch
 ```
 
-Start MAVROS and FAST-LIO first. Odometry must remain tracked and metric. IMU input must contain valid ENU-referenced attitude, FLU body angular velocity in rad/s, and accelerometer specific force including gravity in m/s². The streams must share a time base. Invalid data and duplicate/out-of-order stamps are discarded; changing frame IDs aborts collection.
+For an existing checkout, run `git pull --ff-only` inside the repository and rebuild the workspace. Start MAVROS and FAST-LIO first. Use a dedicated terminal for the calibrator to avoid interleaved logs.
 
-## Motion procedure
+Requirements: rigid assembly; tracked metric odometry; valid ENU-referenced IMU attitude; FLU angular velocity in rad/s; accelerometer specific force including gravity in m/s²; synchronized, increasing timestamps. Invalid/duplicate/out-of-order frames are discarded; frame changes, stale data, and timeouts stop collection. **200 Hz odometry is supported**, independently of IMU rate. Higher rates do not shorten minimum collection times; republishing old poses adds no information.
 
-Keep the assembly rigid. The terminal displays Chinese operation prompts, progress, elapsed/active time, positive/negative rotation totals, and sample counts. A TTY refreshes in place; redirected logs produce plain periodic updates. Set `NO_COLOR=1` to disable colors.
+## Eight-step procedure
 
-| Stage | Operation | Default requirement |
+No keypress is required. Start on a stable surface, pick up once after initialization, stay handheld between axes, and put down after all three axes.
+
+| Step | Operation | Default requirement |
 | --- | --- | --- |
-| Initialization | Rest on a stable surface | 8 s of stable data, at least 100 IMU samples |
-| Before each axis | Return to a comfortable neutral pose and pause | 2 s of stable data |
-| Roll | Gently rock left/right around the body's front-back axis, about ±20–35° | At least 20 s |
-| Pitch | Gently tilt forward/back around the body's left-right axis, about ±20–35° | At least 20 s |
-| Yaw | Stay approximately level and turn left/right, about ±30–45° | At least 20 s |
-| Final validation | Put down gently and let vibration stop | 5 s of stable data, at least 100 IMU samples |
+| 01 / 08 Connect | Start both sources; keep the assembly resting | Valid data within 30 s |
+| 02 / 08 Initialize | Rest on a table or ground, hands off | Full stable 8 s; at least 100 IMU samples |
+| 03 / 08 Pick up | Lift roughly 10 cm or more away from the initial position | At least 5 s of preparation; odometry displacement ≥8 cm sustained for 0.5 s |
+| 04 / 08 Roll | Hold neutral briefly, then rock left/right about ±20–35° around body X | Stable 2 s, then at least 20 s of collection |
+| 05 / 08 Pitch | Stay handheld, pause neutral, tilt forward/back about ±20–35° around body Y | Stable 2 s, then at least 20 s of collection |
+| 06 / 08 Yaw | Stay handheld, pause neutral, stay approximately level and turn left/right about ±30–45° | Stable 2 s, then at least 20 s of collection |
+| 07 / 08 Put down | Place gently on a stable surface, release and let vibration stop | 5 s handling buffer followed by a full stable 5 s |
+| 08 / 08 Solve | Wait for quality gates and result files | Save only after all quality gates pass |
 
-Use natural acceleration/deceleration, about 3–5 s per rocking cycle and typically 3–5 cycles per axis. Continue smoothly until all requirements pass. Avoid abrupt shaking, continuous spinning, or large translation. Each direction must accumulate **1.5 rad (~86°)**; this is cumulative, not a requested single tilt.
+Pickup does not advance on a countdown alone: it waits for actual displacement, timing out after 120 s. This is relative distance, independent of world-axis convention; it does not infer altitude or physical table contact. Pickup, putdown, and neutral preparation data are excluded from the three motion windows.
 
-Each axis also requires at least 8 s of active motion, 300 IMU samples, 80 odometry samples, and corresponding odometry rotation. All requirements must pass together. Odometry rotation is measured independently of mounting orientation, so a 90° mounting rotation does not block collection by requiring matching axis names. Motion alone takes at least 60 s; a complete run normally takes roughly 1.5–3 minutes. Each axis times out after 180 s rather than waiting forever.
+Each rocking cycle should take roughly 3–5 s with natural acceleration/deceleration; typically do 3–5 cycles per axis and continue until all conditions pass. Avoid abrupt shaking, continuous spinning, and large translation.
 
-Static checks use per-sample gyro limits, bias-corrected gyro RMS, gyro/acceleration variation, sample count, window duration, continuity, and attitude change in both streams. A default 1° attitude change relative to the resting reference rejects the candidate, preventing slow constant rotation from being learned as gyro bias. Opposite rotations cannot cancel to pass the check.
+| Per-axis condition | Default target |
+| --- | --- |
+| Collection / active movement | At least 20 / 8 s |
+| Positive / negative angle | At least 1.5 rad (~86°) each, cumulative |
+| IMU / odometry samples | At least 300 / 80 |
+| Total odometry rotation | At least 1.8 rad (~103°), confirming odometry actually rotates |
 
-Detected gyro excursions, acceleration steps, IMU/odometry gaps, or attitude changes **clear the candidate window**. A complete new 8/2/5-second window begins with the next clean IMU sample. Acceptance and the progress display share this window. Movement after putting the assembly down extends the wait; missing/stale data and timeouts produce explicit errors.
+Cumulative angles are not requested single tilts. Mounting orientation is not assumed: matching axis names are not required between streams. Motion alone takes at least 60 s; a full run normally takes about 1.5–3 minutes. Each axis times out after 180 s.
 
-## Frames and outputs
+Static checks include per-sample angular velocity, RMS, gyro/acceleration variation, continuity, and attitude changes in both streams. Motion, acceleration steps, gaps, or attitude changes above 1° clear the candidate window and restart the full duration from subsequent clean data. Slow rotation, opposite rotations, and brief movement cannot bypass checks through averaging.
 
-The transform is defined by:
+## Terminal display
 
-```text
-p_B = R_B_M * p_M + t_B_M
+The Chinese UTF-8 interface uses a consistent card with the current step, action, overall progress, measured values/targets, and remaining requirements. Green `✓` means passed; yellow `○` means pending. Final failures use red `✗` and explicit reasons. Quality arrows `↑ / ↓` show threshold direction.
+
+Columns align by character display width. Cards refresh in place when the terminal is large enough. Small terminals, `TERM=dumb`, and redirected output use periodic logs; stage changes print immediately. Ordinary redirected output contains no terminal escape sequences. `NO_COLOR=1` disables color while retaining supported in-place refresh. The dashboard is not a raw-data recording.
+
+## Frames and result files
+
+Default files:
+
+- `~/.ros/mid360_px4_calibration/result.yaml`
+- `~/.ros/mid360_px4_calibration/result.txt`
+
+The transform is `p_B = R_B_M * p_M + t_B_M`. `M` must be the Mid360 IMU body represented by FAST-LIO; `B` is the MAVROS PX4 FLU reference body. Verify reference origins against the configuration consuming the result. `t_B_M` is the Mid360 origin relative to the PX4 reference origin, expressed in FLU.
+
+FAST-LIO world (usually `camera_init`) need not be ENU. Position derivatives are transformed back into body coordinates. ENU translation is only the fixed FLU offset rotated at `enu_reference_stamp`, not a fixed world-frame extrinsic.
+
+Files include rotation matrix, quaternion `[x,y,z,w]`, fixed FLU translation, reference ENU translation, biases, timing convention, metrics/thresholds, and collection intervals. Matrix/quaternion output replaces legacy `rpy_mid360_to_body_XYZ_deg`; `translation_body_FLU_m` remains an alias.
+
+Absolute, `~/`, and package-relative output paths are supported; parents are created. Rejected calibrations preserve previous results. Files are checked before individual renames, which are not a cross-file atomic transaction; partial save failures report errors. Exit codes: `0` accepted and saved, `2` configuration/collection/save failure, `3` solve/quality rejection.
+
+## Configuration and quality gates
+
+See [online_calibration.yaml](config/online_calibration.yaml). Supply a custom file with:
+
+```bash
+roslaunch mid360_px4_calibration online_calibration.launch config:=/absolute/path/custom.yaml
 ```
 
-`M` must be the Mid360 IMU body represented by FAST-LIO, and `B` is the MAVROS PX4 FLU body reference. Verify that their reference origins match the configuration consuming the result. `t_B_M` is the Mid360 origin relative to the PX4 reference origin, expressed in FLU.
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `pickup_min_duration_s` | 5 | Minimum pickup preparation time |
+| `pickup_min_displacement_m` | 0.08 | Displacement from the initial resting position |
+| `pickup_timeout_s` / `putdown_buffer_s` | 120 / 5 | Pickup timeout / putdown buffer |
+| `axis_min_duration_s` / `axis_min_active_s` | 20 / 8 | Per-axis collection / active time |
+| `axis_direction_target_rad` | 1.5 | Cumulative angle per direction |
+| `static_max_rotation_deg` | 1 | Static-reference attitude-change limit |
+| `imu_time_offset_s` | 0 | Aligned IMU stamp = raw stamp + offset |
+| `max_gyro_rmse_rad_s` | 0.12 | Gyro vector RMSE ceiling |
+| `max_gyro_relative_rmse` / `min_gyro_correlation` | 0.25 / 0.95 | Relative RMSE ceiling / agreement floor |
+| `max_accel_rmse_m_s2` | 0.75 | Acceleration vector RMSE ceiling |
+| `min_rotation_excitation_ratio` | 0.02 | Three-axis excitation floor |
+| `max_translation_condition` | 1000 | Bias-eliminated lever-arm condition ceiling |
+| `min_translation_excitation_rad_s2` | 0.03 | Weakest-direction absolute excitation floor |
+| `min_angular_accel_rms_rad_s2` | 0.1 | Angular acceleration RMS floor |
+| `max_lever_arm_m` | 2 | Physical lever-arm length ceiling |
 
-FAST-LIO world (usually `camera_init`) need not be ENU: position derivatives are transformed back to the FAST-LIO body. The ENU translation is only the fixed FLU lever arm rotated at `enu_reference_stamp`, not a fixed world-frame extrinsic.
+Local cubic fits to position and rotation logarithms use a 0.3 s half-window, ignore usually-zero odometry twist, and do not cross stage boundaries or long gaps. IMU interpolation stays inside valid time ranges. SVD aligns angular velocity; translation and combined acceleration bias are jointly estimated, eliminating bias before testing lever-arm observability.
 
-Default files are `~/.ros/mid360_px4_calibration/result.yaml` and `result.txt`. Parent directories are created. Absolute, `~/`, and package-relative paths are supported. Files are written and checked before individual renames; the two renames are not a cross-file atomic transaction, and partial save failures return an error. Rejected calibrations do not overwrite existing results.
+Relative gyro RMSE is `RMSE / sqrt((IMU_RMS² + odom_RMS²) / 2)`. Agreement is normalized aligned-vector dot-product sum without mean subtraction, not a Pearson coefficient. All absolute/relative residual, agreement, excitation, and physical-size gates must pass.
 
-Files include rotation matrix, quaternion `[x,y,z,w]`, fixed FLU translation, reference ENU translation, gyro/combined accelerometer bias, timestamp offset convention, quality metrics, thresholds, and motion windows. The matrix/quaternion replace the ambiguous legacy `rpy_mid360_to_body_XYZ_deg` field; `translation_body_FLU_m` remains a translation alias.
+**No automatic time-offset estimation.** Synchronize clocks first, applying a nonzero offset only when known. Investigate timing, units, tracking, and rigid mounting before relaxing gates. Acceptance is not an absolute accuracy guarantee; repeat collection and compare the fixed FLU offset against physical measurements.
 
-## Estimation and quality gates
+## Validation and troubleshooting
 
-- Record the actual initialization sample boundaries, avoiding startup delays contaminating bias estimates with later movement.
-- Fit local cubic polynomials to position and local rotation logarithms (default half-window 0.3 s) to estimate acceleration, angular velocity, and angular acceleration. Ignore usually-zero odometry twist, stage boundaries, long gaps, and static samples that could dilute motion residuals.
-- Interpolate strictly inside the IMU time range and reject long gaps. Estimate rotation with SVD and check three-axis excitation, gyro vector RMSE, relative RMSE, and paired-vector agreement.
-- Solve the rigid-body acceleration relation for lever arm and constant combined bias. Eliminate the bias before testing the lever-arm condition number and weakest-direction excitation, accounting for their joint observability.
-- Accept only with adequate rotation consistency, acceleration residual, angular acceleration, and physical lever-arm length. Report every failed quality gate and save only accepted results.
-
-See [config/online_calibration.yaml](config/online_calibration.yaml) for all parameters. Defaults include static attitude change ≤1° (`static_max_rotation_deg`), gyro vector RMSE ≤0.12 rad/s, relative gyro RMSE ≤0.25 (`max_gyro_relative_rmse`), paired-vector agreement ≥0.95 (`min_gyro_correlation`), acceleration vector RMSE ≤0.75 m/s², rotation excitation ratio ≥0.02, bias-eliminated translation condition ≤1000, weakest translation excitation ≥0.03 rad/s², and lever-arm length ≤2 m.
-
-Relative gyro RMSE divides the residual RMS by `sqrt((IMU gyro RMS² + odometry gyro RMS²) / 2)`. Agreement is the sum of aligned vector dot products divided by the square root of the product of stream energies, without subtracting means; it is not a Pearson coefficient. Absolute error, relative error, and agreement must all pass, rejecting unrelated low-amplitude streams and scale mismatches. Metrics and thresholds are displayed and saved.
-
-**Time offset is not estimated automatically.** `aligned_imu_stamp = raw_imu_stamp + imu_time_offset_s`, with default zero. Synchronize clocks first and set a nonzero value only for a known offset. Investigate timing, units, tracking, and rigid mounting before relaxing thresholds. Defaults reject clearly poor data; they do not guarantee accuracy. Repeat runs and compare the fixed FLU offset against physical measurements.
-
-## Tests
-
-The numerical tests need Eigen but no ROS:
+Eigen numerical tests need no ROS:
 
 ```bash
 cd ~/catkin_ws/src/mid360-px4-imu-calibration
@@ -82,7 +116,18 @@ c++ -std=c++14 -O1 -Iinclude -I/usr/include/eigen3 \
 /tmp/calibration_math_test
 ```
 
-Alternatively, after `catkin_make`, enter `~/catkin_ws/build` and run `ctest --output-on-failure -R calibration_math_test`. Coverage includes known extrinsics and bias recovery, 90° mounting, bias-confounded degeneracy, oscillatory static rejection, strict time overlap/gap handling, irregular-sampling derivatives, slow constant rotation, complete static-window restart after a brief movement, return-to-origin motion, low-amplitude/scale mismatch rejection, and noisy three-axis trajectories at 10/20/50/200 Hz. Synthetic tests do not replace real ROS/rosbag and hardware validation.
+With testing enabled in the catkin build, enter `~/catkin_ws/build` and run `ctest --output-on-failure -R calibration_math_test`. Tests cover known extrinsics, bias degeneracy, static restarts, attitude changes, relative gyro errors, pickup confirmation, and noisy 10/20/50/200 Hz trajectories.
+
+| Symptom | First checks |
+| --- | --- |
+| Source timeout | Topic updates, valid attitude, synchronized stamps |
+| Waiting at pickup | Actually move away from the resting position; check odometry position |
+| Handheld preparation restarts | Pause neutral; check vibration and attitude drift |
+| Motion progress stalls | Read pending conditions; time, both directions, samples, and odometry rotation all matter |
+| Quality rejection | Investigate the failed gates; retain the old result rather than only relaxing thresholds |
+| Save failure | Output directory permissions and disk space |
+
+Numerical tests, simulated flows, and terminal checks do not replace a real ROS Noetic/catkin build and hardware validation. Those two validation steps remain outstanding.
 
 ## License
 
