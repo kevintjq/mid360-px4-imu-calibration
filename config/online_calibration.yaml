@@ -19,6 +19,9 @@ output_txt: "~/.ros/mid360_px4_calibration/result.txt"
 # Stable windows use sample timestamps and validate gyro RMS/accel variation.
 static_duration_s: 8.0
 neutral_duration_s: 2.0
+# Both IMU and odometry attitudes must remain within this angle of rest.
+# Movement clears the candidate window and restarts the full duration.
+static_max_rotation_deg: 1.0
 static_validation_duration_s: 5.0
 static_timeout_s: 120.0
 min_static_samples: 100
@@ -43,6 +46,10 @@ min_motion_samples: 150
 # Local cubic pose fit over +/- 0.3 s; rejects gaps and stage boundaries.
 derivative_half_window_s: 0.3
 max_gyro_rmse_rad_s: 0.12
+# Relative RMSE uses the symmetric RMS energy of the paired gyro vectors.
+max_gyro_relative_rmse: 0.25
+# Normalized vector agreement after rotation, not a centered Pearson score.
+min_gyro_correlation: 0.95
 max_accel_rmse_m_s2: 0.75
 min_rotation_excitation_ratio: 0.02
 # These apply AFTER eliminating the constant acceleration bias.

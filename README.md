@@ -37,7 +37,9 @@ Use natural acceleration/deceleration, about 3–5 s per rocking cycle and typic
 
 Each axis also requires at least 8 s of active motion, 300 IMU samples, 80 odometry samples, and corresponding odometry rotation. All requirements must pass together. Odometry rotation is measured independently of mounting orientation, so a 90° mounting rotation does not block collection by requiring matching axis names. Motion alone takes at least 60 s; a complete run normally takes roughly 1.5–3 minutes. Each axis times out after 180 s rather than waiting forever.
 
-Static checks use bias-corrected gyro RMS, gyro/acceleration variation, sample count, window duration, and continuity. Opposite rotations cannot cancel to pass the check. Movement after putting the assembly down extends the wait automatically. Missing/stale data and timeouts produce explicit errors.
+Static checks use per-sample gyro limits, bias-corrected gyro RMS, gyro/acceleration variation, sample count, window duration, continuity, and attitude change in both streams. A default 1° attitude change relative to the resting reference rejects the candidate, preventing slow constant rotation from being learned as gyro bias. Opposite rotations cannot cancel to pass the check.
+
+Detected gyro excursions, acceleration steps, IMU/odometry gaps, or attitude changes **clear the candidate window**. A complete new 8/2/5-second window begins with the next clean IMU sample. Acceptance and the progress display share this window. Movement after putting the assembly down extends the wait; missing/stale data and timeouts produce explicit errors.
 
 ## Frames and outputs
 
@@ -59,11 +61,13 @@ Files include rotation matrix, quaternion `[x,y,z,w]`, fixed FLU translation, re
 
 - Record the actual initialization sample boundaries, avoiding startup delays contaminating bias estimates with later movement.
 - Fit local cubic polynomials to position and local rotation logarithms (default half-window 0.3 s) to estimate acceleration, angular velocity, and angular acceleration. Ignore usually-zero odometry twist, stage boundaries, long gaps, and static samples that could dilute motion residuals.
-- Interpolate strictly inside the IMU time range and reject long gaps. Estimate rotation with SVD and check three-axis excitation plus gyro vector RMSE.
+- Interpolate strictly inside the IMU time range and reject long gaps. Estimate rotation with SVD and check three-axis excitation, gyro vector RMSE, relative RMSE, and paired-vector agreement.
 - Solve the rigid-body acceleration relation for lever arm and constant combined bias. Eliminate the bias before testing the lever-arm condition number and weakest-direction excitation, accounting for their joint observability.
 - Accept only with adequate rotation consistency, acceleration residual, angular acceleration, and physical lever-arm length. Report every failed quality gate and save only accepted results.
 
-See [config/online_calibration.yaml](config/online_calibration.yaml) for all parameters. Defaults include gyro vector RMSE ≤0.12 rad/s, acceleration vector RMSE ≤0.75 m/s², rotation excitation ratio ≥0.02, bias-eliminated translation condition ≤1000, weakest translation excitation ≥0.03 rad/s², and lever-arm length ≤2 m.
+See [config/online_calibration.yaml](config/online_calibration.yaml) for all parameters. Defaults include static attitude change ≤1° (`static_max_rotation_deg`), gyro vector RMSE ≤0.12 rad/s, relative gyro RMSE ≤0.25 (`max_gyro_relative_rmse`), paired-vector agreement ≥0.95 (`min_gyro_correlation`), acceleration vector RMSE ≤0.75 m/s², rotation excitation ratio ≥0.02, bias-eliminated translation condition ≤1000, weakest translation excitation ≥0.03 rad/s², and lever-arm length ≤2 m.
+
+Relative gyro RMSE divides the residual RMS by `sqrt((IMU gyro RMS² + odometry gyro RMS²) / 2)`. Agreement is the sum of aligned vector dot products divided by the square root of the product of stream energies, without subtracting means; it is not a Pearson coefficient. Absolute error, relative error, and agreement must all pass, rejecting unrelated low-amplitude streams and scale mismatches. Metrics and thresholds are displayed and saved.
 
 **Time offset is not estimated automatically.** `aligned_imu_stamp = raw_imu_stamp + imu_time_offset_s`, with default zero. Synchronize clocks first and set a nonzero value only for a known offset. Investigate timing, units, tracking, and rigid mounting before relaxing thresholds. Defaults reject clearly poor data; they do not guarantee accuracy. Repeat runs and compare the fixed FLU offset against physical measurements.
 
@@ -78,7 +82,7 @@ c++ -std=c++14 -O1 -Iinclude -I/usr/include/eigen3 \
 /tmp/calibration_math_test
 ```
 
-Alternatively, after `catkin_make`, enter `~/catkin_ws/build` and run `ctest --output-on-failure -R calibration_math_test`. Coverage includes known extrinsics and bias recovery, 90° mounting, bias-confounded degeneracy, oscillatory static rejection, strict time overlap/gap handling, irregular-sampling derivatives, and noisy three-axis trajectories at 10/20/50 Hz. Synthetic tests do not replace real ROS/rosbag and hardware validation.
+Alternatively, after `catkin_make`, enter `~/catkin_ws/build` and run `ctest --output-on-failure -R calibration_math_test`. Coverage includes known extrinsics and bias recovery, 90° mounting, bias-confounded degeneracy, oscillatory static rejection, strict time overlap/gap handling, irregular-sampling derivatives, slow constant rotation, complete static-window restart after a brief movement, return-to-origin motion, low-amplitude/scale mismatch rejection, and noisy three-axis trajectories at 10/20/50/200 Hz. Synthetic tests do not replace real ROS/rosbag and hardware validation.
 
 ## License
 

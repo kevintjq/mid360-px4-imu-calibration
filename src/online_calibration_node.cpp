@@ -3,6 +3,7 @@
 #include <sensor_msgs/Imu.h>
 #include <nav_msgs/Odometry.h>
 #include <mid360_px4_calibration/calibration_math.h>
+#include <mid360_px4_calibration/static_window.h>
 
 #include <cerrno>
 #include <clocale>
@@ -99,6 +100,7 @@ class Calibrator {
     param("static_duration_s", static_s_, 8.0);
     param("static_validation_duration_s", validation_s_, 5.0);
     param("neutral_duration_s", neutral_s_, 2.0);
+    param("static_max_rotation_deg", static_rotation_deg_, 1.0);
     param("static_timeout_s", static_timeout_, 120.0);
     param("axis_min_duration_s", axis_min_s_, 20.0);
     param("axis_min_active_s", active_s_, 8.0);
@@ -120,6 +122,8 @@ class Calibrator {
     param("max_odom_gap_s", limits_.max_odom_gap, 0.25);
     param("derivative_half_window_s", limits_.derivative_half_window, 0.3);
     param("max_gyro_rmse_rad_s", limits_.max_gyro_rmse, 0.12);
+    param("max_gyro_relative_rmse", limits_.max_gyro_relative_rmse, 0.25);
+    param("min_gyro_correlation", limits_.min_gyro_correlation, 0.95);
     param("max_accel_rmse_m_s2", limits_.max_accel_rmse, 0.75);
     param("min_rotation_excitation_ratio", limits_.min_rotation_ratio, 0.02);
     param("max_translation_condition", limits_.max_translation_condition, 1000.0);
@@ -128,12 +132,15 @@ class Calibrator {
     param("max_lever_arm_m", limits_.max_lever_arm, 2.0);
     if (!std::isfinite(imu_offset_) || !positive(accel_scale_) || !positive(gyro_scale_) ||
         !positive(static_s_) || !positive(validation_s_) || !positive(neutral_s_) ||
-        !positive(static_timeout_) || !positive(axis_min_s_) || !positive(active_s_) ||
+        !positive(static_timeout_) || !positive(static_rotation_deg_) || static_rotation_deg_>=180 ||
+        !positive(axis_min_s_) || !positive(active_s_) ||
         !positive(direction_rad_) || !positive(motion_rate_) || !positive(motion_timeout_) ||
         !positive(update_s_) || update_s_ > 1 || !positive(data_timeout_) ||
         !positive(startup_timeout_) || !positive(recording_timeout_) ||
         !positive(limits_.max_imu_gap) || !positive(limits_.max_odom_gap) ||
         !positive(limits_.derivative_half_window) || !positive(limits_.max_gyro_rmse) ||
+        !positive(limits_.max_gyro_relative_rmse) || !positive(limits_.min_gyro_correlation) ||
+        limits_.min_gyro_correlation>1 ||
         !positive(limits_.max_accel_rmse) || !positive(limits_.min_rotation_ratio) ||
         limits_.min_rotation_ratio > 1 || !positive(limits_.max_translation_condition) ||
         !positive(limits_.min_translation_excitation) || !positive(limits_.min_alpha_rms) ||
@@ -253,37 +260,48 @@ class Calibrator {
     return false;
   }
   bool collectStill(const std::string &name,double duration,bool initial,int min_count,double &begin,double &end) {
-    const double start=imu_.back().t, wall_start=ros::WallTime::now().toSec();
-    double last_movement=start;
-    size_t checked=imu_.size();
+    const double wall_start=ros::WallTime::now().toSec();
+    mc::StaticLimits limits;
+    limits.duration=duration;
+    limits.min_samples=min_count;
+    limits.max_gap=limits_.max_imu_gap;
+    limits.max_gyro=initial ? 0.08 : 0.05;
+    limits.max_rotation_rad=static_rotation_deg_*M_PI/180.0;
+    mc::StaticWindow window(limits,initial ? Vec3::Zero().eval() : gyro_bias_);
+    size_t checked=imu_.size(), odom_checked=odom_.size();
+    Mat3 odom_anchor=odom_.back().R_WM;
+    double previous_odom_time=odom_.back().t;
     while (healthy()) {
       spinFor(update_s_);
       if (!healthy()) return false;
-      for (;checked<imu_.size();++checked) {
-        const auto &sample=imu_[checked];
-        const Vec3 corrected=sample.w-(initial ? Vec3::Zero().eval() : gyro_bias_);
-        if (corrected.norm()>(initial ? 0.08 : 0.05) ||
-            (checked && (sample.a-imu_[checked-1].a).norm()>0.3)) last_movement=sample.t;
+      for (;checked<imu_.size();++checked) window.push(imu_[checked]);
+      for (;odom_checked<odom_.size();++odom_checked) {
+        const auto &pose=odom_[odom_checked];
+        const bool gap=pose.t-previous_odom_time>limits_.max_odom_gap;
+        const bool moved=mc::logSO3(odom_anchor.transpose()*pose.R_WM).norm()>limits.max_rotation_rad;
+        if (gap || moved) {
+          window.invalidate(gap ? "里程计缺帧，重新等待完整静止窗口" :
+                                  "里程计姿态变化，重新等待完整静止窗口");
+          odom_anchor=pose.R_WM;
+        }
+        previous_odom_time=pose.t;
       }
-      end=imu_.back().t; begin=std::max(start,end-duration);
-      const auto s=mc::staticStats(imu_,begin,end,initial ? Vec3::Zero().eval() : gyro_bias_,limits_.max_imu_gap);
-      const bool quiet=s.continuous && s.gyro_rms<(initial ? 0.08 : 0.05) &&
-                       s.gyro_std<0.02 && s.accel_std<0.15 &&
-                       std::abs(s.accel_mean.norm()-9.80665)<1.5;
-      const bool full=end-start>=duration && s.span>=duration-std::min(0.05,0.1*duration) &&
-                      s.samples>=static_cast<size_t>(min_count);
-      ui_.panel(name,std::min(1.0,(end-last_movement)/duration),{
-        "将设备放稳，保持静止 "+number(duration,0)+" 秒；移动后自动等待新的稳定窗口。",
-        "窗口 "+number(s.span,1)+" 秒 · 样本 "+std::to_string(s.samples)+" / 至少 "+std::to_string(min_count),
-        "角速度 RMS "+number(s.gyro_rms,3)+" rad/s · 加速度波动 "+number(s.accel_std,3)+" m/s²",
-        quiet ? "状态：稳定，正在检查连续窗口" : "状态：检测到运动、缺帧或加速度异常，请放稳"});
-      if (quiet && full) { ui_.clear(); return true; }
+      const auto state=window.evaluate();
+      const auto &stats=state.stats;
+      ui_.panel(name,std::min(1.0,state.stable_s/duration),{
+        "将设备放稳，连续静止 "+number(duration,0)+" 秒；检测到运动后完整重新计时。",
+        "连续静止 "+number(state.stable_s,1)+" / "+number(duration,0)+" 秒 · 样本 "+std::to_string(stats.samples)+" / 至少 "+std::to_string(min_count),
+        "角速度 RMS "+number(stats.gyro_rms,3)+" rad/s · 加速度波动 "+number(stats.accel_std,3)+" m/s²",
+        "IMU 姿态变化 "+number(state.rotation_rad*180/M_PI,2)+"° · 两路姿态上限 "+number(static_rotation_deg_,1)+"°",
+        state.reason});
+      if (state.ready) { begin=state.begin;end=state.end;ui_.clear();return true; }
       if (ros::WallTime::now().toSec()-wall_start>static_timeout_) {
-        error_="静止采集超时，检查振动、话题频率、时间戳和加速度单位"; return false;
+        error_="静止采集超时，检查振动、姿态漂移、话题频率、时间戳和加速度单位"; return false;
       }
     }
     return false;
   }
+
   bool collectAxis(int axis,const std::string &name,const std::string &help) {
     const double start=imu_.back().t, wall_start=ros::WallTime::now().toSec();
     size_t ii=imu_.size(), oi=odom_.size(), imu_count=0, odom_count=0;
@@ -333,6 +351,8 @@ class Calibrator {
     const std::string status=r.accepted ? "✓ 质量验收通过" : "✗ 质量验收未通过";
     ui_.message(status+"\n  有效运动配对: "+std::to_string(r.samples)+
       "\n  角速度 RMSE: "+number(r.gyro_rmse,4)+" / "+number(limits_.max_gyro_rmse,3)+" rad/s"+
+      "\n  角速度相对误差: "+number(r.gyro_relative_rmse*100,1)+"%（至多 "+number(limits_.max_gyro_relative_rmse*100,0)+"%）"+
+      "\n  角速度一致性: "+number(r.gyro_correlation,4)+"（至少 "+number(limits_.min_gyro_correlation,2)+"）"+
       "\n  加速度 RMSE: "+number(r.accel_rmse,4)+" / "+number(limits_.max_accel_rmse,3)+" m/s²"+
       "\n  三轴激励比: "+number(r.rotation_ratio,4)+"（至少 "+number(limits_.min_rotation_ratio,3)+"）"+
       "\n  杆臂条件数: "+number(r.translation_condition,2)+"（至多 "+number(limits_.max_translation_condition,0)+"）"+
@@ -390,6 +410,10 @@ class Calibrator {
         <<"  convention: \"aligned_imu_stamp = raw_imu_stamp + imu_time_offset_s\"\n"
         <<"  automatic_time_offset_estimation: false\n"
         <<"quality:\n  accepted: true\n  gyro_rmse_rad_s: "<<r.gyro_rmse
+        <<"\n  gyro_relative_rmse: "<<r.gyro_relative_rmse
+        <<"\n  gyro_correlation: "<<r.gyro_correlation
+        <<"\n  imu_gyro_rms_rad_s: "<<r.imu_gyro_rms
+        <<"\n  odom_gyro_rms_rad_s: "<<r.odom_gyro_rms
         <<"\n  accel_rmse_m_s2: "<<r.accel_rmse
         <<"\n  rotation_excitation_ratio: "<<r.rotation_ratio
         <<"\n  translation_condition_number: "<<r.translation_condition
@@ -397,13 +421,16 @@ class Calibrator {
         <<"\n  odom_angular_accel_rms_rad_s2: "<<r.alpha_rms
         <<"\n  odom_motion_samples: "<<r.samples<<"\n"
         <<"limits:\n  max_gyro_rmse_rad_s: "<<limits_.max_gyro_rmse
+        <<"\n  max_gyro_relative_rmse: "<<limits_.max_gyro_relative_rmse
+        <<"\n  min_gyro_correlation: "<<limits_.min_gyro_correlation
         <<"\n  max_accel_rmse_m_s2: "<<limits_.max_accel_rmse
         <<"\n  min_rotation_excitation_ratio: "<<limits_.min_rotation_ratio
         <<"\n  max_translation_condition: "<<limits_.max_translation_condition
         <<"\n  min_translation_excitation_rad_s2: "<<limits_.min_translation_excitation
         <<"\n  min_angular_accel_rms_rad_s2: "<<limits_.min_alpha_rms
         <<"\n  max_lever_arm_m: "<<limits_.max_lever_arm<<"\n"
-        <<"collection:\n  invalid_or_out_of_order_imu: "<<dropped_imu_
+        <<"collection:\n  static_max_rotation_deg: "<<static_rotation_deg_
+        <<"\n  invalid_or_out_of_order_imu: "<<dropped_imu_
         <<"\n  invalid_or_out_of_order_odom: "<<dropped_odom_<<"\n  axes:\n";
       for (const auto &window:windows_) fy<<"    - {begin: "<<window.begin<<", end: "<<window.end
         <<", duration_s: "<<window.end-window.begin<<"}\n";
@@ -434,7 +461,7 @@ class Calibrator {
   std::vector<mc::Interval> windows_;
   Vec3 gyro_bias_=Vec3::Zero(),accel_bias_=Vec3::Zero();
   std::string imu_topic_,odom_topic_,output_yaml_,output_txt_,body_frame_,world_frame_,mid_frame_,error_;
-  double accel_scale_,gyro_scale_,imu_offset_,static_s_,validation_s_,neutral_s_,static_timeout_;
+  double accel_scale_,gyro_scale_,imu_offset_,static_s_,validation_s_,neutral_s_,static_timeout_,static_rotation_deg_;
   double axis_min_s_,active_s_,direction_rad_,motion_rate_,motion_timeout_,update_s_;
   double data_timeout_,startup_timeout_,recording_timeout_,started_=0,last_imu_wall_=0,last_odom_wall_=0;
   int min_static_,axis_min_imu_,axis_min_odom_,min_samples_,min_odom_;

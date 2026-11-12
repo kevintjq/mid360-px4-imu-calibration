@@ -1,4 +1,5 @@
 #include <mid360_px4_calibration/calibration_math.h>
+#include <mid360_px4_calibration/static_window.h>
 #include <iostream>
 #include <stdexcept>
 #include <random>
@@ -48,6 +49,77 @@ void staticTest() {
   v.erase(v.begin()+30,v.begin()+60);
   s=mc::staticStats(v,0,6,Vec3::Zero(),0.1);
   require(!s.continuous,"static window must detect missing data");
+}
+void staticWindowTest() {
+  mc::StaticLimits limits;
+  mc::StaticWindow still(limits,Vec3::Zero());
+  auto sample=[](double t,const Vec3 &w,const Mat3 &R=Mat3::Identity()) {
+    return mc::Imu{t,w,Vec3(0,0,9.80665),R};
+  };
+  for (int i=0;i<=1600;++i)
+    still.push(sample(i*0.005,Vec3(0.005*std::sin(i),0,0)));
+  require(still.evaluate().ready,"stationary noisy 200 Hz data should pass");
+  // One moving sample used to be hidden by the eight-second RMS average.
+  still.push(sample(8.005,Vec3(0.1,0,0)));
+  require(!still.evaluate().ready && still.evaluate().stats.samples==0,"brief movement did not clear window");
+  for (int i=1602;i<=3201;++i) still.push(sample(i*0.005,Vec3::Zero()));
+  require(!still.evaluate().ready,"static window passed before eight new seconds");
+  still.push(sample(16.015,Vec3::Zero()));
+  require(still.evaluate().ready,"complete new static window did not pass");
+  // A data gap must reset the actual candidate window as well.
+  still.push(sample(16.3,Vec3::Zero()));
+  require(!still.evaluate().ready,"static gap did not restart window");
+
+  mc::StaticWindow slow_yaw(limits,Vec3::Zero());
+  std::vector<mc::Imu> old_window;
+  for (int i=0;i<=3200;++i) {
+    const double t=i*0.005;
+    const auto b=sample(t,Vec3(0,0,0.04),Eigen::AngleAxisd(0.04*t,Vec3::UnitZ()).toRotationMatrix());
+    slow_yaw.push(b);
+    if(i<=1600) old_window.push_back(b);
+  }
+  require(mc::staticStats(old_window,0,8,Vec3::Zero(),0.1).gyro_rms<0.08,"slow-yaw fixture must evade old RMS threshold");
+  require(!slow_yaw.evaluate().ready && slow_yaw.evaluate().stable_s<1,"slow yaw was mistaken for gyro bias");
+
+  mc::StaticWindow out_and_back(limits,Vec3::Zero());
+  for (int i=0;i<=1000;++i) out_and_back.push(sample(i*0.005,Vec3::Zero()));
+  out_and_back.push(sample(5.005,Vec3::Zero(),Eigen::AngleAxisd(0.04,Vec3::UnitX()).toRotationMatrix()));
+  for (int i=1002;i<=2600;++i) out_and_back.push(sample(i*0.005,Vec3::Zero()));
+  require(!out_and_back.evaluate().ready,"returning to the original attitude reused pre-movement samples");
+}
+void relativeGyroTest() {
+  std::vector<mc::Motion> motion;
+  std::vector<mc::Imu> imu;
+  for(int i=0;i<10000;++i) {
+    const double t=i*0.01;
+    mc::Motion m;
+    m.t=t;m.a=Vec3::Zero();
+    m.w=Vec3(0.05*std::sin(1.4*t),0.05*std::sin(1.8*t),0.05*std::sin(2.2*t));
+    m.alpha=Vec3(0.07*std::cos(1.4*t),0.09*std::cos(1.8*t),0.11*std::cos(2.2*t));
+    motion.push_back(m);
+    imu.push_back({t,Vec3(0.085*std::sin(2.4*t),0.085*std::sin(2.8*t),0.085*std::sin(3.2*t)),Vec3(0,0,9.80665),Mat3::Identity()});
+  }
+  mc::Limits limits;
+  const auto mismatch=mc::solve(motion,imu,Vec3::Zero(),Vec3::Zero(),limits);
+  require(mismatch.gyro_rmse<limits.max_gyro_rmse,"fixture must evade old absolute gyro threshold");
+  require(!mismatch.accepted && mismatch.gyro_relative_rmse>limits.max_gyro_relative_rmse &&
+          mismatch.gyro_correlation<limits.min_gyro_correlation,"unrelated low-amplitude gyro streams passed");
+  // A coherent small-amplitude signal must still be accepted.
+  Fixture f;
+  for(size_t i=0;i<f.motion.size();++i) {
+    auto &m=f.motion[i];auto &b=f.imu[i];
+    m.w*=0.2;m.alpha*=0.2;
+    b.w=f.R*m.w+f.gb+Vec3(0.002*std::sin(13*m.t),0,0);
+    b.a=f.R*m.a+f.R*(mc::skew(m.alpha)+mc::skew(m.w)*mc::skew(m.w))*(-f.R.transpose()*f.lever)+
+        f.ab-b.R_EB.transpose()*Vec3(0,0,-9.80665);
+  }
+  auto result=mc::solve(f.motion,f.imu,f.gb,Vec3::Zero(),limits);
+  require(result.accepted && result.gyro_relative_rmse<0.05,"coherent low-amplitude motion was rejected");
+  // Matching waveform but wrong scale: correlation alone must not suffice.
+  for(size_t i=0;i<f.motion.size();++i) f.imu[i].w=1.5*f.R*f.motion[i].w+f.gb;
+  result=mc::solve(f.motion,f.imu,f.gb,Vec3::Zero(),limits);
+  require(!result.accepted && result.gyro_correlation>0.999 &&
+          result.gyro_relative_rmse>limits.max_gyro_relative_rmse,"gyro scale mismatch was accepted");
 }
 void recoveryTest() {
   Fixture f; mc::Limits lim;
@@ -124,7 +196,7 @@ void trajectoryTest() {
     p={t,pm,RM};
     b={t,unit*rate+truth.gb,RB.transpose()*(ab_world-Vec3(0,0,-9.80665))+truth.ab,RB};
   };
-  for (const int hz:{10,20,50}) {
+  for (const int hz:{10,20,50,200}) {
     std::vector<mc::Pose> poses;
     std::vector<mc::Imu> imu;
     for (int i=0;i<=60*hz;++i) {
@@ -151,8 +223,8 @@ void trajectoryTest() {
 }
 int main() {
   try {
-    interpolationTest(); staticTest(); recoveryTest(); degeneracyTest(); overlapTest(); differentiationTest(); trajectoryTest();
-    std::cout<<"PASS: interpolation, static RMS, known extrinsics, gyro rejection, bias degeneracy, overlap, smoothed derivatives\n";
+    interpolationTest(); staticTest(); staticWindowTest(); relativeGyroTest(); recoveryTest(); degeneracyTest(); overlapTest(); differentiationTest(); trajectoryTest();
+    std::cout<<"PASS: static restart/attitude gates, relative gyro consistency, interpolation, extrinsics, bias degeneracy, overlap, derivatives, 10/20/50/200 Hz\n";
     return 0;
   } catch (const std::exception &e) { std::cerr<<"FAIL: "<<e.what()<<"\n"; return 1; }
 }

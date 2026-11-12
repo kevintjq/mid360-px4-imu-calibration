@@ -19,6 +19,7 @@ struct Limits {
   double max_imu_gap = 0.1, max_odom_gap = 0.25;
   double derivative_half_window = 0.3;
   double max_gyro_rmse = 0.12, max_accel_rmse = 0.75;
+  double max_gyro_relative_rmse = 0.25, min_gyro_correlation = 0.95;
   double min_rotation_ratio = 0.02;
   double max_translation_condition = 1000.0;
   double min_translation_excitation = 0.03, min_alpha_rms = 0.1;
@@ -29,6 +30,8 @@ struct Result {
   Mat3 R_B_M = Mat3::Identity();
   Vec3 t_B_M = Vec3::Zero(), accel_bias = Vec3::Zero();
   double gyro_rmse = 0, accel_rmse = 0, rotation_ratio = 0;
+  double gyro_relative_rmse = std::numeric_limits<double>::infinity();
+  double gyro_correlation = 0, imu_gyro_rms = 0, odom_gyro_rms = 0;
   double translation_condition = std::numeric_limits<double>::infinity();
   double translation_excitation = 0, alpha_rms = 0;
   size_t samples = 0;
@@ -169,15 +172,26 @@ inline Result solve(const std::vector<Motion> &motion, const std::vector<Imu> &i
   Mat3 mean_C = Mat3::Zero();
   Vec3 mean_y = Vec3::Zero();
   const Vec3 gravity(0,0,-9.80665);
+  double agreement = 0;
   for (size_t i = 0; i < ms.size(); ++i) {
     const auto &m = ms[i]; const auto &b = bs[i];
     r.gyro_rmse += (b.w-r.R_B_M*m.w).squaredNorm();
+    r.imu_gyro_rms += b.w.squaredNorm();
+    r.odom_gyro_rms += m.w.squaredNorm();
+    agreement += b.w.dot(r.R_B_M*m.w);
     r.alpha_rms += m.alpha.squaredNorm();
     const Mat3 C = r.R_B_M*(skew(m.alpha)+skew(m.w)*skew(m.w));
     const Vec3 y = b.a-initial_accel_bias+b.R_EB.transpose()*gravity-r.R_B_M*m.a;
     Cs.push_back(C); ys.push_back(y); mean_C += C; mean_y += y;
   }
   r.gyro_rmse = std::sqrt(r.gyro_rmse/ms.size());
+  const double denominator = std::sqrt(r.imu_gyro_rms*r.odom_gyro_rms);
+  if (denominator > 1e-12) r.gyro_correlation = std::max(-1.0,std::min(1.0,agreement/denominator));
+  r.imu_gyro_rms = std::sqrt(r.imu_gyro_rms/ms.size());
+  r.odom_gyro_rms = std::sqrt(r.odom_gyro_rms/ms.size());
+  const double signal_rms = std::sqrt(0.5*(r.imu_gyro_rms*r.imu_gyro_rms+
+                                          r.odom_gyro_rms*r.odom_gyro_rms));
+  if (signal_rms > 1e-9) r.gyro_relative_rmse = r.gyro_rmse/signal_rms;
   r.alpha_rms = std::sqrt(r.alpha_rms/ms.size());
   mean_C /= ms.size(); mean_y /= ms.size();
   Eigen::MatrixXd C0(3*ms.size(),3);
@@ -200,6 +214,10 @@ inline Result solve(const std::vector<Motion> &motion, const std::vector<Imu> &i
       !std::isfinite(r.gyro_rmse) || !std::isfinite(r.accel_rmse)) r.reasons.push_back("求解出现非有限数值");
   if (r.rotation_ratio < lim.min_rotation_ratio) r.reasons.push_back("三轴旋转激励不充分");
   if (r.gyro_rmse > lim.max_gyro_rmse) r.reasons.push_back("角速度匹配误差过大（检查时间同步、单位和刚性安装）");
+  if (!std::isfinite(r.gyro_relative_rmse) || r.gyro_relative_rmse > lim.max_gyro_relative_rmse)
+    r.reasons.push_back("角速度相对误差过大，不能用低运动幅度掩盖旋转失配");
+  if (r.gyro_correlation < lim.min_gyro_correlation)
+    r.reasons.push_back("两路角速度运动不一致，请检查时间同步和数据来源");
   if (r.accel_rmse > lim.max_accel_rmse) r.reasons.push_back("加速度残差过大（检查里程计跟踪和振动）");
   if (!std::isfinite(r.translation_condition) || r.translation_condition > lim.max_translation_condition ||
       r.translation_excitation < lim.min_translation_excitation) r.reasons.push_back("杆臂与偏置无法可靠区分，请增加平滑加减速的三轴转动");
